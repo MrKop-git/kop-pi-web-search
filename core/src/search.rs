@@ -167,7 +167,6 @@ fn host_of(url: &str) -> String {
 /// 一个「浏览器身份」：自己的 cookie jar（独立 reqwest::Client）与自己的节流表
 struct Identity {
     client: reqwest::Client,
-    user_agent: &'static str,
     sec_ch_ua: &'static str,
     platform: &'static str,
     last_at: Mutex<HashMap<String, Instant>>,
@@ -177,6 +176,7 @@ struct Identity {
 impl Identity {
     fn new(index: usize) -> Result<Self> {
         let (user_agent, sec_ch_ua, platform) = IDENTITIES[index];
+        // UA 直接设进 client，请求期不用再带
         let client = reqwest::Client::builder()
             .user_agent(user_agent)
             .cookie_store(true)
@@ -184,7 +184,7 @@ impl Identity {
             .timeout(Duration::from_secs(12))
             .build()
             .context("构建 HTTP 客户端失败")?;
-        Ok(Self { client, user_agent, sec_ch_ua, platform, last_at: Mutex::new(HashMap::new()), warmed_at: Mutex::new(None) })
+        Ok(Self { client, sec_ch_ua, platform, last_at: Mutex::new(HashMap::new()), warmed_at: Mutex::new(None) })
     }
 }
 
