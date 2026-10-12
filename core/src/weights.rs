@@ -229,6 +229,13 @@ pub fn match_weight(weights: &SourceWeights, host: &str) -> (f32, Option<String>
     }
 }
 
+/// 域名后缀匹配：`a.b.com` 命中 `b.com`，`notb.com` 与 `github.com.evil.cn` 不命中
+pub fn domain_matches(host: &str, pattern: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    !pattern.is_empty() && (host == pattern || host.ends_with(&format!(".{pattern}")))
+}
+
 pub fn host_of(url: &str) -> String {
     url::Url::parse(url).ok().and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase())).unwrap_or_default()
 }

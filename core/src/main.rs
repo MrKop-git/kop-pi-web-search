@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
             let count = args.get(2).and_then(|c| c.parse().ok());
             let params = protocol::SearchParams {
                 query,
+                queries: None,
                 count,
                 offset: None,
                 sites: None,
@@ -59,6 +60,10 @@ async fn main() -> Result<()> {
                 content_chars: None,
                 min_weight: None,
                 sort_by: None,
+                recency_days: None,
+                domains: None,
+                exclude_domains: None,
+                budget_ms: None,
             };
             match engine.search(params).await {
                 Ok(pkg) => println!("{}", serde_json::to_string_pretty(&pkg)?),
@@ -202,6 +207,24 @@ async fn run_selftest(engine: &mut Engine) -> Result<()> {
         }
         Err(e) => check("嵌入器", false, e.to_string()),
     }
+
+    check(
+        "时间窗: 只丢确定过期的（无日期不丢）",
+        text::older_than("2000-01-01", 30)
+            && !text::older_than(
+                &text::date_from_epoch_secs(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)),
+                30,
+            )
+            && !text::older_than("不是日期", 1),
+        String::new(),
+    );
+    check(
+        "域名匹配: 后缀命中、伪后缀不命中",
+        weights::domain_matches("a.github.com", "github.com")
+            && !weights::domain_matches("notgithub.com", "github.com")
+            && !weights::domain_matches("github.com.evil.cn", "github.com"),
+        String::new(),
+    );
 
     let stats = engine.store.stats()?;
     println!("\n库状态: {stats}");

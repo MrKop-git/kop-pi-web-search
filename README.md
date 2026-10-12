@@ -29,7 +29,9 @@ keeps the embedding model loaded across calls.
 
 | | |
 |---|---|
-| **Two tools** | `web_search` (search + fetch + filter + score) and `web_fetch` |
+| **Two tools** | `web_search` (discover: results + dates, page bodies only on request) and `web_fetch` (read one page, with `find=` for keyword jumps) |
+| **Multi-query** | `queries=[...]` runs up to 4 phrasings in parallel and merges them round-robin, deduplicated by URL — one call instead of four |
+| **Filters** | `recencyDays`, `domains` (allow-list), `excludeDomains`, `minWeight`, `sites` — plus `budgetMs` to cap the content stage |
 | **Search engine** | Bing SERP scraping with a coherent browser fingerprint and pacing |
 | **Site-direct search** | `sites=["github","csdn"]` skips the engine; 14 native APIs, `site:`-scoped Bing for the rest |
 | **Journals & venues** | 顶会/期刊信源：`sites=["期刊"]` 只收头部刊——SE/PL 的 TSE/TOSEM/TOPLAS/EMSE，AI/NLP 的 JMLR/TPAMI/AIJ/TACL/CL/Nature MI，以及软件学报/计算机学报，全部走 OpenAlex 按 ISSN 检索（`sites=["tse"]` 单刊直达）；`sites=["顶会"]` 覆盖 OpenReview/NeurIPS/ICML/ACL/USENIX/SIGPLAN/ICSE；另有 `大模型` / `软件工程` 领域标签 |
@@ -38,7 +40,7 @@ keeps the embedding model loaded across calls.
 | **Newest first** | results are sorted by publish date (newest first, undated last) unless `sortBy="relevance"`; freshness also feeds confidence (15%) |
 | **Content pages only** | homepages, section roots and list/index pages are dropped before fetching |
 | **Core-text extraction** | nav/ads/sidebars/comment blocks/menu lines removed; headings and prose kept |
-| **Parallel scheduling** | one wait window bounds the content stage; pages are fetched 16-way, so more pages = more content, not more latency |
+| **Parallel scheduling** | one wait window bounds the content stage (1.5 s, and only when `includeContent=true`); pages are fetched 16-way, so more pages = more content, not more latency |
 | **Trust data** | per-domain weights and two-layer blocklists (domains + keyword patterns) in SQLite |
 | **Confidence** | relevance + source weight + cross-source corroboration, from local embeddings |
 | **Storage** | SQLite (rusqlite) with sqlite-vec vectors and an FTS5 index over fetched text |
@@ -96,15 +98,22 @@ Restart pi (or `/reload`) and both tools are available.
 ## Usage
 
 ```
-web_search(query="sqlite-vec", count=8, contentTop=8)
-web_search(query="向量检索", sites=["掘金","中文博客"])     # aliases, tags or domains
-web_search(query="code generation", sites=["顶会","大模型"])  # 会议/领域标签
-web_search(query="code generation", sites=["期刊","tse"])    # 头部期刊（全量 or 单刊）
-web_fetch(url="https://docs.rs/sqlite-vec")
+web_search(query="sqlite-vec 向量检索")
+web_search(query="Strata 吞吐优化", queries=["Strata parallel slots", "Strata batch 显存"])   # 多说法一次跑完
+web_search(query="code generation", recencyDays=90, domains=["arxiv.org"])                    # 时间窗 + 域名白名单
+web_search(query="向量检索", sites=["掘金","中文博客"])                                        # aliases, tags or domains
+web_search(query="code generation", sites=["顶会","大模型"])                                   # 会议/领域标签
+web_search(query="code generation", sites=["期刊","tse"])                                      # 头部期刊（全量 or 单刊）
+web_search(query="rust 所有权", includeContent=true, contentTop=3, budgetMs=4000)              # 显式抓正文
+web_fetch(url="https://docs.rs/sqlite-vec")                        # 整页
+web_fetch(url="https://doc.rust-lang.org/book/", find="borrow")    # 只回命中行（带行号）
+web_fetch(url="https://doc.rust-lang.org/book/", fromLine=120)     # 从第 120 行读下去
 ```
 
-`web_search` parameters: `query`, `count` (8), `offset`, `sites`, `includeContent` (true),
-`contentTop` (8), `contentChars` (1000), `minWeight`, `sortBy` (`time` | `relevance`).
+`web_search` parameters: `query`, `queries` (≤3 extra phrasings), `count` (8), `offset`, `sites`,
+`includeContent` (**false**), `contentTop` (8, used only when content is on), `contentChars` (1000),
+`minWeight`, `sortBy` (`time` | `relevance`), `recencyDays`, `domains`, `excludeDomains`, `budgetMs`.
+`web_fetch` parameters: `url`, `maxChars` (20000), `find`, `fromLine`.
 
 Output is a JSON package — `{ query, engine, fetchedAt, results[], dropped[], meta{} }` —
 where every result carries `weight`, `via`, `published` (YYYY-MM-DD or null), `recency`
@@ -161,8 +170,12 @@ sqlite3 ~/.pi/agent/web-search.db "SELECT query, fetched_at FROM searches ORDER 
 
 ## Design notes
 
-- **One wait window** (`CONTENT_WAIT_MS`, default 3 s, env `PI_WS_CONTENT_WAIT_MS`) bounds the
-  content stage; whatever finishes in it is attached, the rest are marked *"not returned
+- **Search first, read later**: fetching bodies inside `web_search` is the slow part, so it is off by
+  default (`includeContent=false`) — the model gets titles, snippets and dates, then `web_fetch`es the
+  page it actually needs. `web_fetch` can jump to a keyword (`find`) or a line (`fromLine`), so reading a
+  100 KB page costs a few hundred tokens instead of twenty thousand.
+- **One wait window** (`CONTENT_WAIT_MS`, default 1.5 s, env `PI_WS_CONTENT_WAIT_MS`, capped by
+  `budgetMs`) bounds the content stage; whatever finishes in it is attached, the rest are marked *"not returned
   within the window"* and keep fetching in the background — their text lands in the cache,
   so a repeat search gets them for free.
 - **Freshness**: the date comes from the result block (Bing prints one for most Chinese results),
@@ -170,6 +183,11 @@ sqlite3 ~/.pi/agent/web-search.db "SELECT query, fetched_at FROM searches ORDER 
   are empty. Recency is `0.5^(age/365)`; undated results get a neutral 0.5 rather than a penalty.
 - **Confidence is a heuristic**, not fact-checking: 35% similarity to the query, 20% domain trust,
   30% how many *independent* domains in the same batch agree, 15% freshness.
+- **Multi-query merging** mirrors what codex/deepseek-harness do: several phrasings, merged round-robin
+  and deduplicated by URL. Pipe work runs in parallel, but Bing pacing still costs ≥1.2 s per query, so
+  four queries take ~5 s — the saving is round-trips, not wall-clock.
+- **External content is labelled**: both tools prefix their output with an untrusted-data notice and a
+  cite-your-sources instruction, so page text never reads like a system instruction.
 - **Ranking is Bing's; filtering and ordering are ours.** Homepage/list detection, the blocklists,
   the source weights and the `sortBy` date ordering are the levers that shape the result list.
 - **Etiquette**: Bing requests are paced ≥1.2 s apart, page fetches are capped per host, and

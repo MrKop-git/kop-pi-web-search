@@ -32,6 +32,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 const DEFAULT_COUNT: usize = 8;
+const MAX_QUERIES: usize = 4;
 const MAX_COUNT: usize = 20;
 const DEFAULT_CONTENT_TOP: usize = 8;
 const DEFAULT_CONTENT_CHARS: usize = 1000;
@@ -43,7 +44,19 @@ fn content_concurrency() -> usize {
 
 /// 内容阶段等待窗口：窗口内并行完成多少页就带多少页
 fn content_wait_ms() -> u64 {
-    env_usize("PI_WS_CONTENT_WAIT_MS", 3000) as u64
+    env_usize("PI_WS_CONTENT_WAIT_MS", 1500) as u64
+}
+
+/// 去重与合并用的 URL 归一：忽略 host 大小写、fragment 与末尾斜杠
+fn normalize_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_fragment(None);
+            let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+            format!("{host}{}?{}", parsed.path().trim_end_matches('/'), parsed.query().unwrap_or_default())
+        }
+        Err(_) => url.to_string(),
+    }
 }
 
 fn is_bing_host(host: &str) -> bool {
@@ -382,18 +395,36 @@ impl Engine {
         if query.is_empty() {
             anyhow::bail!("query 不能为空");
         }
+        // 多查询：query + queries（去重、最多 4 条）并发检索后轮询合并
+        let mut queries: Vec<String> = vec![query.clone()];
+        for extra in params.queries.clone().unwrap_or_default() {
+            let extra = extra.trim().to_string();
+            if !extra.is_empty() && !queries.contains(&extra) {
+                queries.push(extra);
+            }
+        }
+        queries.truncate(MAX_QUERIES);
+
         let count = params.count.unwrap_or(DEFAULT_COUNT).min(MAX_COUNT).max(1);
         let offset = params.offset.unwrap_or(0);
-        let include_content = params.include_content.unwrap_or(true);
+        // 默认不抓正文：要正文让模型明确要，或改用 web_fetch（这是延迟的大头）
+        let include_content = params.include_content.unwrap_or(false);
         let content_top = params.content_top.unwrap_or(DEFAULT_CONTENT_TOP);
         let content_chars = params.content_chars.unwrap_or(DEFAULT_CONTENT_CHARS).min(5000);
         let min_weight = params.min_weight;
         let sort_by_time = params.sort_by.as_deref().unwrap_or("time") != "relevance";
+        let recency_days = params.recency_days;
+        let domains = params.domains.clone().unwrap_or_default();
+        let exclude_domains = params.exclude_domains.clone().unwrap_or_default();
         let weights = self.store.load_weights()?;
 
         // 站内直达 or Bing 全网
         let site_tokens = params.sites.clone().unwrap_or_default();
-        let resolved = if site_tokens.is_empty() { Vec::new() } else { weights::resolve_sites(&weights, &site_tokens) };
+        let resolved: Vec<(String, weights::SiteEntry)> = if site_tokens.is_empty() {
+            Vec::new()
+        } else {
+            weights::resolve_sites(&weights, &site_tokens).into_iter().map(|(alias, entry)| (alias, entry.clone())).collect()
+        };
         if !site_tokens.is_empty() && resolved.is_empty() {
             let available: Vec<String> = weights
                 .sites
@@ -404,61 +435,52 @@ impl Engine {
         }
 
         let serp_started = Instant::now();
+        let mut tasks = Vec::new();
+        for one in &queries {
+            let fetcher = self.fetcher.clone();
+            let resolved = resolved.clone();
+            let one = one.clone();
+            tasks.push(tokio::spawn(async move { gather_one(&fetcher, &resolved, &one, offset).await }));
+        }
+        let mut per_query: Vec<Vec<(SearchResult, String)>> = Vec::new();
+        let mut engines: Vec<String> = Vec::new();
+        let mut sites_used: Option<Vec<String>> = None;
+        let mut failures: Vec<String> = Vec::new();
+        for (index, task) in tasks.into_iter().enumerate() {
+            match task.await {
+                Ok(Ok(gathered)) => {
+                    if !engines.contains(&gathered.engine) {
+                        engines.push(gathered.engine);
+                    }
+                    if sites_used.is_none() {
+                        sites_used = gathered.sites;
+                    }
+                    per_query.push(gathered.candidates);
+                }
+                Ok(Err(err)) => failures.push(format!("{}: {err}", queries[index])),
+                Err(err) => failures.push(format!("{}: 任务失败 {err}", queries[index])),
+            }
+        }
+        if per_query.is_empty() {
+            anyhow::bail!("检索失败：{}", failures.join("; "));
+        }
+        for failure in &failures {
+            eprintln!("[pi-web-search] 查询失败（已跳过）：{failure}");
+        }
+        let engine_name = engines.join("+");
+
+        // 轮询合并 + URL 去重：每个查询的第一条并排，避免单查询霸榜
+        let mut seen: HashSet<String> = HashSet::new();
         let mut candidates: Vec<(SearchResult, String)> = Vec::new();
-        let engine_name;
-        let sites_used: Option<Vec<String>>;
-        if !resolved.is_empty() {
-            engine_name = resolved.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>().join("+");
-            sites_used = Some(resolved.iter().map(|(a, _)| a.clone()).collect());
-            let bing_sites: Vec<(String, &weights::SiteEntry)> =
-                resolved.iter().filter(|(_, e)| e.search.kind == "bing-site").map(|(a, e)| (a.clone(), *e)).collect();
-            let api_sites: Vec<(String, &weights::SiteEntry)> =
-                resolved.iter().filter(|(_, e)| e.search.kind != "bing-site").map(|(a, e)| (a.clone(), *e)).collect();
-
-            let mut per_site: Vec<Vec<(SearchResult, String)>> = Vec::new();
-            let mut failures: Vec<String> = Vec::new();
-
-            // 原生 API 站：并发
-            let api_results = self.search_api_sites(&api_sites, &query).await;
-            for (alias, res) in api_results {
-                match res {
-                    Ok(rs) => per_site.push(rs.into_iter().map(|r| (r, alias.clone())).collect()),
-                    Err(e) => failures.push(format!("{alias}: {e}")),
-                }
-            }
-
-            // Bing 兜底站：合并成一次 (site:a OR site:b) 查询
-            if !bing_sites.is_empty() {
-                let domains: Vec<String> = bing_sites.iter().map(|(_, e)| e.domain.clone()).collect();
-                match self.fetch_bing_scoped(&domains, &query).await {
-                    Ok(results) => {
-                        for (alias, entry) in &bing_sites {
-                            let filtered = adapters::filter_to_domain(results.clone(), &entry.domain);
-                            per_site.push(filtered.into_iter().take(8).map(|r| (r, alias.clone())).collect());
-                        }
-                    }
-                    Err(e) => failures.push(format!("bing: {e}")),
-                }
-            }
-
-            // 各站轮询交错，避免单站占满配额
-            let max_len = per_site.iter().map(|v| v.len()).max().unwrap_or(0);
-            for i in 0..max_len {
-                for list in &per_site {
-                    if let Some(item) = list.get(i) {
-                        candidates.push(item.clone());
+        let longest = per_query.iter().map(|list| list.len()).max().unwrap_or(0);
+        for rank in 0..longest {
+            for list in &per_query {
+                if let Some((item, via)) = list.get(rank) {
+                    if seen.insert(normalize_url(&item.url)) {
+                        candidates.push((item.clone(), via.clone()));
                     }
                 }
             }
-            if candidates.is_empty() {
-                anyhow::bail!("站内搜索无结果{}", if failures.is_empty() { String::new() } else { format!("；失败：{}", failures.join("; ")) });
-            }
-        } else {
-            engine_name = "bing".to_string();
-            sites_used = None;
-            self.fetcher.ensure_bing_session().await;
-            let results = self.fetch_bing_serp(&query, offset).await?;
-            candidates = results.into_iter().map(|r| (r, "bing".to_string())).collect();
         }
         let serp_ms = serp_started.elapsed().as_millis() as u64;
 
@@ -477,6 +499,23 @@ impl Engine {
             if let Some(reason) = weights::check_blocked(&weights, &r) {
                 dropped.push(DroppedResult { title: r.title, url: r.url, weight, reason });
                 continue;
+            }
+            if !domains.is_empty() && !domains.iter().any(|pattern| weights::domain_matches(&host, pattern)) {
+                dropped.push(DroppedResult { title: r.title, url: r.url, weight, reason: "不在 domains 白名单".into() });
+                continue;
+            }
+            if exclude_domains.iter().any(|pattern| weights::domain_matches(&host, pattern)) {
+                dropped.push(DroppedResult { title: r.title, url: r.url, weight, reason: "命中 excludeDomains".into() });
+                continue;
+            }
+            if let Some(days) = recency_days {
+                if let Some(published) = &r.published {
+                    if text::older_than(published, days) {
+                        let reason = format!("早于 recencyDays={days}（{published}）");
+                        dropped.push(DroppedResult { title: r.title, url: r.url, weight, reason });
+                        continue;
+                    }
+                }
             }
             if let Some(mw) = min_weight {
                 if weight < mw {
@@ -537,8 +576,9 @@ impl Engine {
                     done.fetch_add(1, Ordering::SeqCst);
                 }));
             }
-            // 等到窗口结束（后台任务继续跑，完成的内容会写进缓存）
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(content_wait_ms());
+            // 等到窗口结束（后台任务继续跑，完成的内容会写进缓存）；budgetMs 收紧窗口
+            let wait_ms = content_wait_ms().min(params.budget_ms.unwrap_or(u64::MAX));
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
             while done.load(Ordering::SeqCst) < total {
                 if tokio::time::Instant::now() >= deadline {
                     break;
@@ -549,7 +589,7 @@ impl Engine {
             for (slot_idx, result_idx) in fetch_list.iter().enumerate() {
                 let content = match slots[slot_idx].clone() {
                     Some(c) => c,
-                    None => failed(format!("未在 {}s 等待窗口内返回（后台仍在抓，已写入缓存）", content_wait_ms() / 1000)),
+                    None => failed(format!("未在 {wait_ms}ms 等待窗口内返回（后台仍在抓，已写入缓存）")),
                 };
                 kept[*result_idx].content = Some(content);
             }
@@ -652,7 +692,11 @@ impl Engine {
                 fetched_pages,
                 failed_pages,
                 sites: sites_used,
+                queries: queries.clone(),
                 sort_by: if sort_by_time { "time".to_string() } else { "relevance".to_string() },
+                recency_days,
+                domains: if domains.is_empty() { None } else { Some(domains.clone()) },
+                exclude_domains: if exclude_domains.is_empty() { None } else { Some(exclude_domains.clone()) },
                 timings: Timings {
                     serp_ms,
                     content_ms,
@@ -664,84 +708,6 @@ impl Engine {
         let params_json = serde_json::to_string(&params).unwrap_or_default();
         let _ = self.store.record_search(&pkg, &params_json);
         Ok(pkg)
-    }
-
-    async fn search_api_sites(
-        &self,
-        sites: &[(String, &weights::SiteEntry)],
-        query: &str,
-    ) -> Vec<(String, Result<Vec<SearchResult>>)> {
-        let mut out = Vec::new();
-        let mut tasks = Vec::new();
-        let sem = Arc::new(tokio::sync::Semaphore::new(SITE_CONCURRENCY));
-        for (alias, entry) in sites {
-            let Some((url, body, referer, origin)) = site_request(&entry.search.kind, entry.search.site.as_deref(), query) else {
-                out.push((alias.clone(), Err(anyhow::anyhow!("未知适配器 {}", entry.search.kind))));
-                continue;
-            };
-            let fetcher = self.fetcher.clone();
-            let sem = sem.clone();
-            let alias = alias.clone();
-            let kind = entry.search.kind.clone();
-            tasks.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await;
-                let method = if body.is_some() { reqwest::Method::POST } else { reqwest::Method::GET };
-                let _ = origin;
-                match fetcher.request(method, &url, Some(&referer), "same-origin", body).await {
-                    Ok((status, text, _)) if (200..300).contains(&status) => (alias, Ok(parse_site_response(&kind, &text).into_iter().take(8).collect())),
-                    Ok((status, _, _)) => (alias, Err(anyhow::anyhow!("HTTP {status}"))),
-                    Err(e) => (alias, Err(e)),
-                }
-            }));
-        }
-        for task in tasks {
-            match task.await {
-                Ok(v) => out.push(v),
-                Err(e) => out.push((String::from("?"), Err(anyhow::anyhow!("任务失败: {e}")))),
-            }
-        }
-        out
-    }
-
-    async fn fetch_bing_scoped(&self, domains: &[String], query: &str) -> Result<Vec<SearchResult>> {
-        self.fetcher.ensure_bing_session().await;
-        let scope = if domains.len() == 1 {
-            format!("site:{}", domains[0])
-        } else {
-            format!("({})", domains.iter().map(|d| format!("site:{d}")).collect::<Vec<_>>().join(" OR "))
-        };
-        let url = format!(
-            "{BING_SEARCH}?q={}&first=1&form=QBRE&setmkt=zh-CN&setlang=zh-hans",
-            urlencode(&format!("{scope} {query}"))
-        );
-        let (status, body, _) = self.fetcher.get(&url, Some(BING_HOME), "same-origin").await?;
-        if !(200..300).contains(&status) {
-            anyhow::bail!("Bing HTTP {status}");
-        }
-        if text::looks_like_captcha(&body) {
-            anyhow::bail!("Bing 返回风控页");
-        }
-        Ok(text::parse_bing_results(&body))
-    }
-
-    async fn fetch_bing_serp(&self, query: &str, offset: usize) -> Result<Vec<SearchResult>> {
-        let url = format!(
-            "{BING_SEARCH}?q={}&first={}&form=QBRE&setmkt=zh-CN&setlang=zh-hans",
-            urlencode(query),
-            offset + 1
-        );
-        let (status, body, _) = self.fetcher.get(&url, Some(BING_HOME), "same-origin").await?;
-        if !(200..300).contains(&status) {
-            anyhow::bail!("Bing 返回 HTTP {status}");
-        }
-        if text::looks_like_captcha(&body) {
-            anyhow::bail!("Bing 返回了验证码/风控页，稍后重试或换查询词");
-        }
-        let results = text::parse_bing_results(&body);
-        if results.is_empty() {
-            anyhow::bail!("未解析到结果（query={query:?}）。可能无结果、页面结构变化、或被风控");
-        }
-        Ok(results)
     }
 
     /// 单页抓取（web_fetch 工具）
@@ -769,8 +735,17 @@ impl Engine {
         if !page.ok {
             anyhow::bail!("web_fetch: {}", page.error.unwrap_or_else(|| "抓取失败".into()));
         }
-        let truncated = page.core_text.chars().count() > max_chars;
-        let shown: String = page.core_text.chars().take(max_chars).collect();
+        // 页内定位：先按 find / fromLine 切行，再套 maxChars
+        let lines: Vec<&str> = page.core_text.lines().collect();
+        let total_lines = lines.len();
+        let start = params.from_line.unwrap_or(1).max(1) - 1;
+        let pattern = params.find.as_deref().map(str::trim).filter(|p| !p.is_empty());
+        let (body, matched_lines) = match pattern {
+            Some(pattern) => select_matching_lines(&lines, pattern, start),
+            None => (lines[start.min(lines.len())..].join("\n"), None),
+        };
+        let truncated = body.chars().count() > max_chars;
+        let shown: String = body.chars().take(max_chars).collect();
         Ok(FetchPackage {
             url: parsed.to_string(),
             final_url: parsed.to_string(),
@@ -781,8 +756,184 @@ impl Engine {
             core_text: shown,
             chars: page.chars,
             truncated,
+            total_lines,
+            matched_lines,
         })
     }
+}
+
+/// 取命中 `pattern` 的行（行号 + 前后各一行上下文），行号按原页从 1 数
+fn select_matching_lines(lines: &[&str], pattern: &str, start: usize) -> (String, Option<usize>) {
+    const MAX_HITS: usize = 60;
+    let needle = pattern.to_lowercase();
+    let mut hits: Vec<usize> = Vec::new();
+    for (index, line) in lines.iter().enumerate().skip(start) {
+        if line.to_lowercase().contains(&needle) {
+            if hits.len() == MAX_HITS {
+                break;
+            }
+            hits.push(index);
+        }
+    }
+    if hits.is_empty() {
+        return (String::new(), Some(0));
+    }
+    let mut wanted: Vec<usize> = Vec::new();
+    for hit in &hits {
+        for offset in [-1i64, 0, 1] {
+            let index = *hit as i64 + offset;
+            if index >= 0 && (index as usize) < lines.len() && !wanted.contains(&(index as usize)) {
+                wanted.push(index as usize);
+            }
+        }
+    }
+    wanted.sort_unstable();
+    let body = wanted.iter().map(|index| format!("{}: {}", index + 1, lines[*index].trim())).collect::<Vec<_>>().join("\n");
+    (body, Some(hits.len()))
+}
+
+/// 一条查询的候选集（站内直达 or Bing 全网），不同查询之间可以并发跑
+struct Gathered {
+    candidates: Vec<(SearchResult, String)>,
+    engine: String,
+    sites: Option<Vec<String>>,
+}
+
+async fn gather_one(
+    fetcher: &Fetcher,
+    resolved: &[(String, weights::SiteEntry)],
+    query: &str,
+    offset: usize,
+) -> Result<Gathered> {
+    if resolved.is_empty() {
+        fetcher.ensure_bing_session().await;
+        let results = fetch_bing_serp(fetcher, query, offset).await?;
+        return Ok(Gathered {
+            candidates: results.into_iter().map(|r| (r, "bing".to_string())).collect(),
+            engine: "bing".to_string(),
+            sites: None,
+        });
+    }
+
+    let engine = resolved.iter().map(|(alias, _)| alias.clone()).collect::<Vec<_>>().join("+");
+    let sites = Some(resolved.iter().map(|(alias, _)| alias.clone()).collect());
+    let api_sites: Vec<(String, weights::SiteEntry)> = resolved.iter().filter(|(_, entry)| entry.search.kind != "bing-site").cloned().collect();
+    let bing_sites: Vec<(String, weights::SiteEntry)> = resolved.iter().filter(|(_, entry)| entry.search.kind == "bing-site").cloned().collect();
+
+    let mut per_site: Vec<Vec<(SearchResult, String)>> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (alias, outcome) in search_api_sites(fetcher, &api_sites, query).await {
+        match outcome {
+            Ok(results) => per_site.push(results.into_iter().map(|r| (r, alias.clone())).collect()),
+            Err(err) => failures.push(format!("{alias}: {err}")),
+        }
+    }
+    if !bing_sites.is_empty() {
+        let domains: Vec<String> = bing_sites.iter().map(|(_, entry)| entry.domain.clone()).collect();
+        match fetch_bing_scoped(fetcher, &domains, query).await {
+            Ok(results) => {
+                for (alias, entry) in &bing_sites {
+                    let filtered = adapters::filter_to_domain(results.clone(), &entry.domain);
+                    per_site.push(filtered.into_iter().take(8).map(|r| (r, alias.clone())).collect());
+                }
+            }
+            Err(err) => failures.push(format!("bing: {err}")),
+        }
+    }
+
+    // 各站轮询交错，避免单站占满配额
+    let mut candidates: Vec<(SearchResult, String)> = Vec::new();
+    let longest = per_site.iter().map(|list| list.len()).max().unwrap_or(0);
+    for rank in 0..longest {
+        for list in &per_site {
+            if let Some(item) = list.get(rank) {
+                candidates.push(item.clone());
+            }
+        }
+    }
+    if candidates.is_empty() {
+        anyhow::bail!("站内搜索无结果{}", if failures.is_empty() { String::new() } else { format!("；失败：{}", failures.join("; ")) });
+    }
+    Ok(Gathered { candidates, engine, sites })
+}
+
+/// 原生 API 站：并发查询，返回（别名，结果）
+async fn search_api_sites(
+fetcher: &Fetcher,
+sites: &[(String, weights::SiteEntry)],
+query: &str,
+) -> Vec<(String, Result<Vec<SearchResult>>)> {
+let mut out = Vec::new();
+let mut tasks = Vec::new();
+let sem = Arc::new(tokio::sync::Semaphore::new(SITE_CONCURRENCY));
+for (alias, entry) in sites {
+        let Some((url, body, referer, origin)) = site_request(&entry.search.kind, entry.search.site.as_deref(), query) else {
+            out.push((alias.clone(), Err(anyhow::anyhow!("未知适配器 {}", entry.search.kind))));
+            continue;
+        };
+        let fetcher = fetcher.clone();
+        let sem = sem.clone();
+        let alias = alias.clone();
+        let kind = entry.search.kind.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            let method = if body.is_some() { reqwest::Method::POST } else { reqwest::Method::GET };
+            let _ = origin;
+            match fetcher.request(method, &url, Some(&referer), "same-origin", body).await {
+                Ok((status, text, _)) if (200..300).contains(&status) => (alias, Ok(parse_site_response(&kind, &text).into_iter().take(8).collect())),
+                Ok((status, _, _)) => (alias, Err(anyhow::anyhow!("HTTP {status}"))),
+                Err(e) => (alias, Err(e)),
+            }
+        }));
+    }
+    for task in tasks {
+        match task.await {
+            Ok(v) => out.push(v),
+            Err(e) => out.push((String::from("?"), Err(anyhow::anyhow!("任务失败: {e}")))),
+        }
+    }
+    out
+}
+
+async fn fetch_bing_scoped(fetcher: &Fetcher, domains: &[String], query: &str) -> Result<Vec<SearchResult>> {
+fetcher.ensure_bing_session().await;
+    let scope = if domains.len() == 1 {
+        format!("site:{}", domains[0])
+    } else {
+        format!("({})", domains.iter().map(|d| format!("site:{d}")).collect::<Vec<_>>().join(" OR "))
+    };
+    let url = format!(
+        "{BING_SEARCH}?q={}&first=1&form=QBRE&setmkt=zh-CN&setlang=zh-hans",
+        urlencode(&format!("{scope} {query}"))
+    );
+let (status, body, _) = fetcher.get(&url, Some(BING_HOME), "same-origin").await?;
+    if !(200..300).contains(&status) {
+        anyhow::bail!("Bing HTTP {status}");
+    }
+    if text::looks_like_captcha(&body) {
+        anyhow::bail!("Bing 返回风控页");
+    }
+    Ok(text::parse_bing_results(&body))
+}
+
+async fn fetch_bing_serp(fetcher: &Fetcher, query: &str, offset: usize) -> Result<Vec<SearchResult>> {
+    let url = format!(
+        "{BING_SEARCH}?q={}&first={}&form=QBRE&setmkt=zh-CN&setlang=zh-hans",
+        urlencode(query),
+        offset + 1
+    );
+let (status, body, _) = fetcher.get(&url, Some(BING_HOME), "same-origin").await?;
+if !(200..300).contains(&status) {
+    anyhow::bail!("Bing 返回 HTTP {status}");
+    }
+    if text::looks_like_captcha(&body) {
+        anyhow::bail!("Bing 返回了验证码/风控页，稍后重试或换查询词");
+    }
+    let results = text::parse_bing_results(&body);
+    if results.is_empty() {
+        anyhow::bail!("未解析到结果（query={query:?}）。可能无结果、页面结构变化、或被风控");
+    }
+    Ok(results)
 }
 
 pub fn now_rfc3339() -> String {

@@ -15,6 +15,9 @@ pub enum Request {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchParams {
     pub query: String,
+    /// 追加查询：与 query 一起并发检索后轮询合并（最多 4 条）
+    #[serde(default)]
+    pub queries: Option<Vec<String>>,
     #[serde(default)]
     pub count: Option<usize>,
     #[serde(default)]
@@ -32,6 +35,18 @@ pub struct SearchParams {
     /// `time`（默认，按发布时间倒序）或 `relevance`（保持引擎原序）
     #[serde(default, rename = "sortBy")]
     pub sort_by: Option<String>,
+    /// 只保留最近 N 天发布的结果（没有日期的结果保留）
+    #[serde(default, rename = "recencyDays")]
+    pub recency_days: Option<u32>,
+    /// 域名白名单（后缀匹配）
+    #[serde(default)]
+    pub domains: Option<Vec<String>>,
+    /// 本次调用临时屏蔽的域名
+    #[serde(default, rename = "excludeDomains")]
+    pub exclude_domains: Option<Vec<String>>,
+    /// 本次调用的总预算（毫秒）：超出就缩短内容等待窗口
+    #[serde(default, rename = "budgetMs")]
+    pub budget_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -39,6 +54,12 @@ pub struct FetchParams {
     pub url: String,
     #[serde(default, rename = "maxChars")]
     pub max_chars: Option<usize>,
+    /// 只回包含该串的行（带行号，附一行上下文）
+    #[serde(default)]
+    pub find: Option<String>,
+    /// 从第几行开始返回（1 起）
+    #[serde(default, rename = "fromLine")]
+    pub from_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,8 +132,15 @@ pub struct PackageMeta {
     #[serde(rename = "failedPages")]
     pub failed_pages: usize,
     pub sites: Option<Vec<String>>,
+    /// 本次实际检索的查询词（多查询时按顺序列出）
+    pub queries: Vec<String>,
     #[serde(rename = "sortBy")]
     pub sort_by: String,
+    #[serde(rename = "recencyDays")]
+    pub recency_days: Option<u32>,
+    pub domains: Option<Vec<String>>,
+    #[serde(rename = "excludeDomains")]
+    pub exclude_domains: Option<Vec<String>>,
     pub timings: Timings,
 }
 
@@ -142,5 +170,10 @@ pub struct FetchPackage {
     pub core_text: String,
     pub chars: usize,
     pub truncated: bool,
+    #[serde(rename = "totalLines")]
+    pub total_lines: usize,
+    /// `find` 命中的行数（没传 find 时为 null）
+    #[serde(rename = "matchedLines")]
+    pub matched_lines: Option<usize>,
 }
 

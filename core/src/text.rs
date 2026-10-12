@@ -163,6 +163,14 @@ fn parse_ymd(date: &str) -> Option<(i64, i64, i64)> {
     Some((y, m, d))
 }
 
+/// 发布是否早于 `days` 天前（解析不出日期时返回 false：没日期的结果不按时间窗丢弃）
+pub fn older_than(published: &str, days: u32) -> bool {
+    match parse_ymd(published) {
+        Some((y, m, d)) => today() - days_from_civil(y, m, d) > days as i64,
+        None => false,
+    }
+}
+
 /// 新鲜度：半衰期 365 天（今天 = 1，一年前 = 0.5，两年前 = 0.25）；无日期给中性 0.5
 pub fn recency_score(published: Option<&str>) -> f32 {
     let age = published.and_then(parse_ymd).map(|(y, m, d)| today() - days_from_civil(y, m, d));
