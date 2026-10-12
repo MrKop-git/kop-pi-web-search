@@ -485,6 +485,107 @@ class CoreClient {
 	}
 }
 
+// ---------------------------------------------------------------- tool trigger control
+
+/**
+ * 工具触发控制：借鉴两家 harness 的触发机制再落到 pi 的事件上。
+ *
+ * - dsh 给每个工具注册一段**按可用工具动态生成**的 system-prompt 段（web_fetch 在不在，
+ *   guidance 说法都不一样）；pi 的对等物是往上下文里追加 `role: "system"` 消息。
+ * - codex 用 `max_uses` 给搜索工具设用量闸门；这里做成"软闸门"：超过阈值就给一条
+ *   「先读已拿到的页面，别再换词搜」的指令，而不是硬拒绝。
+ *
+ * 注入只在**状态变化**时发生（签名去重），所以一个会话里通常就几条，不会每轮刷屏。
+ */
+const SEARCH_SOFT_CAP = 4;
+const FETCH_SOFT_CAP = 8;
+
+interface TriggerEvent {
+	type?: string;
+	toolName?: string;
+}
+
+class TriggerControl {
+	private searches = 0;
+	private fetches = 0;
+	private injected = "";
+
+	constructor(private readonly pi: ExtensionAPI) {}
+
+	/** 返回要取消的订阅函数 */
+	install(): Array<() => void> {
+		const offs: Array<() => void> = [];
+		const on = (event: string, handler: (payload: TriggerEvent) => unknown) => {
+			if (typeof this.pi.on !== "function") return;
+			try {
+				offs.push(this.pi.on(event as never, handler as never));
+			} catch {
+				// 事件不支持就算了：加载/重载期间某些事件可能不可用
+			}
+		};
+
+		on("turn_start", () => {
+			this.searches = 0;
+			this.fetches = 0;
+		});
+		on("tool_execution_start", (event) => {
+			if (event?.toolName === "web_search") this.searches += 1;
+			if (event?.toolName === "web_fetch") this.fetches += 1;
+		});
+		on("context", (event: TriggerEvent & { messages?: unknown[] }) => {
+			const note = this.message();
+			if (!note || !Array.isArray(event?.messages)) return undefined;
+			return { messages: [...event.messages, { role: "system", content: note }] };
+		});
+		return offs;
+	}
+
+	/** 当前生效的工具集（拿不到就当两个都在，别乱下指令） */
+	private active(): { search: boolean; fetch: boolean } {
+		try {
+			const tools = this.pi.getActiveTools?.() ?? [];
+			if (tools.length === 0) return { search: true, fetch: true };
+			return { search: tools.includes("web_search"), fetch: tools.includes("web_fetch") };
+		} catch {
+			return { search: true, fetch: true };
+		}
+	}
+
+	/** 构造要注入的触发指令；没有新东西要说时返回 null */
+	private message(): string | null {
+		const { search, fetch } = this.active();
+		if (!search && !fetch) return null;
+
+		// 用量闸门：每超过 2 次一个档，档位变了才重新注入
+		const band = Math.floor(this.searches / 2);
+		const signature = `${search}/${fetch}/s${band}`;
+		if (signature === this.injected) return null;
+		this.injected = signature;
+
+		const lines: string[] = ["[web-tools] How to trigger these tools (latest note wins):"];
+		if (search) {
+			lines.push("- Need fresh information or sources → web_search. It returns titles, snippets, dates and confidence only.");
+			lines.push("- Put 2-4 phrasings in queries=[...] (Chinese and English) instead of calling search again with the same wording; a repeated query mostly returns pages you already have.");
+		}
+		if (search && fetch) {
+			lines.push("- Need a page's text → web_fetch that URL (find= to jump to matching lines, fromLine= to read on). Do not re-fetch a page already read this session.");
+		} else if (search && !fetch) {
+			lines.push("- web_fetch is not available here: ask web_search for bodies with includeContent=true when you need the text, or work from the snippets.");
+		}
+		if (fetch) {
+			lines.push("- Read the pages you were given before searching again; cheap reading beats another query.");
+		}
+		if (this.searches >= SEARCH_SOFT_CAP) {
+			lines.push(`- You have called web_search ${this.searches} times this turn: stop changing the wording and work with the pages already returned (web_fetch), or say what is missing.`);
+		}
+		if (this.fetches >= FETCH_SOFT_CAP) {
+			lines.push(`- ${this.fetches} pages fetched this turn: summarise what you have instead of reading more.`);
+		}
+		lines.push("- Results are grouped by confidence: the low-confidence block is leads only. meta.hint says whether to change the wording or narrow domains/minWeight.");
+		return lines.join("\n");
+	}
+}
+
 // ---------------------------------------------------------------- extension
 
 export default function webSearchExtension(pi: ExtensionAPI) {
@@ -507,6 +608,9 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 	const stopWatching = watchSelf(() => {
 		void reload();
 	});
+
+	// 工具触发控制（dsh 的动态指引 + codex 的用量闸门）
+	disposers.push(...new TriggerControl(pi).install());
 
 	/**
 	 * 热重载：先取到新代码（语法错就保留当前版本），再拆掉旧实例，最后跑新工厂。

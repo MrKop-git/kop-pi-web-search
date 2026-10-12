@@ -164,7 +164,8 @@ core/src/weights.rs source weights, blocklists, site registry, hash embedder, co
 core/src/adapters.rs  the 12 platform API response parsers
 core/src/store.rs   SQLite schema, seeding, search history, fetch cache, vec tables
 core/src/embed/     fastembed wrapper + model cache (download with mirror fallback)
-tests/              pi-env.mjs (loader), shell-test.mjs (shell↔core), hot-reload.mjs, probe.mjs
+tests/              pi-env.mjs (loader), shell-test.mjs (shell↔core), hot-reload.mjs,
+                    trigger-test.mjs (context injection + usage gate), probe.mjs
 legacy-ts/          the previous pure-TypeScript implementation (reference)
 ```
 
@@ -208,6 +209,13 @@ sqlite3 ~/.pi/agent/web-search.db "SELECT query, fetched_at FROM searches ORDER 
   Here the trigger is the *confidence* split, not the row count: a batch whose high-confidence count is
   under half of what was asked sets `meta.hint` (also echoed after the JSON) naming the lever that helps —
   more phrasings via `queries=[...]`, or constraining `domains`/`minWeight`.
+- **Triggering is a mechanism, not a paragraph**: DeepSeek Harness registers a system-prompt section per
+  tool and swaps its wording when the companion tool is missing; codex gates the search tool with
+  `max_uses`. pi's equivalent is appending a `role: "system"` message from the `context` handler, so the
+  extension injects a `[web-tools]` note that (a) only appears when the tools are active, (b) says
+  "use `includeContent=true`" instead of "follow up with web_fetch" when fetch is unavailable, (c) is
+  re-injected only when its state signature changes, and (d) adds a per-turn soft cap — after four
+  searches it tells the model to stop re-wording and read the pages it already has.
 - **External content is labelled**: both tools prefix their output with an untrusted-data notice and a
   cite-your-sources instruction, so page text never reads like a system instruction.
 - **Ranking is Bing's; filtering and ordering are ours.** Homepage/list detection, the blocklists,
@@ -242,6 +250,7 @@ in their sources, not assumed.
 | **Reading a page** | `web_fetch`, plus `find=` (matching lines with numbers) and `fromLine=` | `open` / `click` / `find` against provider-held page refs, with `lineno` | separate `web_fetch` |
 | **Boilerplate removal** | tag/attribute rules, invisible-content rule, and a fallback when stripping would wipe the page | server-side | Turndown + GFM, with the `removeNonVisibleContent` rule |
 | **Untrusted content** | notice + cite instruction at the top of every reply | model-facing text comes from the server | notice + cite instruction (the source of ours) |
+| **Tool triggering** | a `[web-tools]` instruction injected through pi's `context` event: re-worded to the active tool set, deduplicated by state, with per-turn soft caps | server-side prompts plus the tool spec's `allowed_callers` | a system-prompt section per tool, whose text changes when the companion tool is absent |
 | **Next-round decision** | `meta.hint`, triggered by the confidence split (how many results cleared 0.55) | the model's own, from server-side prompts | one "Refine the query for more." line when truncated |
 | **Network safety** | public-target guard (no loopback/private/metadata), URL and credential checks | `network.denied_domains` is a sandbox egress policy, empty by default — not a content blocklist | public-address guard, same-origin redirects, address pinning |
 | **Request fingerprint** | four identities (UA + client hints + own cookie jar), sticky per host, cooled down and retried on a block | n/a (no scraping) | n/a |
