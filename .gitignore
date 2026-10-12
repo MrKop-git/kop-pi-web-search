@@ -1,0 +1,13 @@
+# third-party runtime artifacts (fetched by scripts/fetch-vendor.sh)
+vendor/
+
+# local data / scratch
+*.db
+*.db-wal
+*.db-shm
+web-sources.json
+logs/
+node_modules/
+*.log
+
+.DS_Store
