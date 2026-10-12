@@ -227,6 +227,40 @@ sqlite3 ~/.pi/agent/web-search.db "SELECT query, fetched_at FROM searches ORDER 
   but no core text; ACL Anthology and 软件学报 fetch fine. DBLP is behind Anubis, which leaves it a
   weighted source rather than a searchable one.
 
+## How this compares
+
+Written after reading `openai/codex` and `deepseek-ai/deepseek-harness` to see how two shipping
+harnesses wire web search, and to be explicit about what was borrowed. Every row below was checked
+in their sources, not assumed.
+
+| | this extension | codex | DeepSeek Harness |
+|---|---|---|---|
+| **Search backend** | Bing SERP scraping + 16 native APIs, all local | hosted search service; the client sends `SearchRequest.commands` | pluggable providers (deepseek / exa / perplexity); no local scraping |
+| **Result quality signal** | per-domain weights, blocklists, confidence = relevance + weight + cross-source corroboration + freshness, recency filter | `filters.allowed_domains` / `blocked_domains`, `search_context_size` (low/medium/high) | provider ranking only — no weights, no score |
+| **Confidence without page bodies** | yes: title + snippet embedding plus a lexical-coverage term, `confidenceBasis` says which | n/a (the server answers) | n/a |
+| **Overlap** | deduplicated inside a call *and* across calls (10-minute window over recorded URLs) | none client-side | inside one call only (multi-query merge; the provider collapses a `max_uses>1` request) |
+| **Reading a page** | `web_fetch`, plus `find=` (matching lines with numbers) and `fromLine=` | `open` / `click` / `find` against provider-held page refs, with `lineno` | separate `web_fetch` |
+| **Boilerplate removal** | tag/attribute rules, invisible-content rule, and a fallback when stripping would wipe the page | server-side | Turndown + GFM, with the `removeNonVisibleContent` rule |
+| **Untrusted content** | notice + cite instruction at the top of every reply | model-facing text comes from the server | notice + cite instruction (the source of ours) |
+| **Next-round decision** | `meta.hint`, triggered by the confidence split (how many results cleared 0.55) | the model's own, from server-side prompts | one "Refine the query for more." line when truncated |
+| **Network safety** | public-target guard (no loopback/private/metadata), URL and credential checks | `network.denied_domains` is a sandbox egress policy, empty by default — not a content blocklist | public-address guard, same-origin redirects, address pinning |
+| **Request fingerprint** | four identities (UA + client hints + own cookie jar), sticky per host, cooled down and retried on a block | n/a (no scraping) | n/a |
+
+**Borrowed from DeepSeek Harness**: the untrusted-content notice and cite instruction, merging
+multiple query phrasings round-robin with URL dedupe, stating the tool's budget in prompt guidance,
+the invisible-content rule (`hidden` / `aria-hidden` / `input[type=hidden]` / inline `display:none`,
+`visibility:hidden|collapse`), and the public-address guard for fetches.
+
+**Borrowed from codex**: the glob semantics of domain patterns (`*.example.com`, `**.example.com`,
+in-label `region*.foo.com`) for allow/deny filters, and the search → open → find decomposition that
+our `queries` / `web_fetch(find=)` mirrors.
+
+**Deliberately different**: neither of them synthesises an answer locally either, but both can lean on a
+search service that does — we don't, because it would mean an API key and a quota. TLS/HTTP2
+fingerprints are still native-tls, so identity rotation buys session continuity, not Cloudflare-proof
+impersonation. Redirects are validated but not pinned to an address, and cross-origin redirects are
+followed (up to five), where DeepSeek Harness refuses them.
+
 ## License
 
 MIT © Kop
