@@ -118,7 +118,8 @@ web_fetch(url="https://doc.rust-lang.org/book/", fromLine=120)     # 从第 120 
 `web_search` parameters: `query`, `queries` (≤3 extra phrasings), `count` (8), `offset`, `sites`,
 `includeContent` (**false**), `contentTop` (8, used only when content is on), `contentChars` (1000),
 `minWeight`, `sortBy` (`time` | `relevance`), `recencyDays`, `domains`, `excludeDomains` (both take
-suffixes or `*` / `**` globs), `budgetMs`, `dedupeWindowMinutes` (10; 0 disables).
+suffixes or `*` / `**` globs), `budgetMs`, `dedupeWindowMinutes` (10; 0 disables). `meta.hint` carries
+the suggested next step when a call came back short or mostly repetitive.
 `web_fetch` parameters: `url`, `maxChars` (20000), `find`, `fromLine`.
 
 Output is a JSON package — `{ query, engine, fetchedAt, results[], dropped[], meta{} }` —
@@ -196,6 +197,11 @@ sqlite3 ~/.pi/agent/web-search.db "SELECT query, fetched_at FROM searches ORDER 
   drops pages already returned in the last ten minutes (`via` does not matter, so a page coming back
   through Bing after a site-direct call is caught too). If that would leave nothing at all, the repeats
   are kept and flagged `seen` instead of returning an empty list. `dedupeWindowMinutes=0` turns it off.
+- **The package says what to do next**: neither codex nor DeepSeek Harness turns a search result's shape
+  into a next-step decision — codex renders the action for the UI (`web_search_action_detail`) and counts
+  searches for analytics, dsh only appends a "Refine the query for more." line when it truncated. Here a
+  call that came back short, or that mostly hit the repeat window, sets `meta.hint` (also echoed after the
+  JSON) telling the model which lever to pull: `queries=[...]`, or relaxing `recencyDays`/`domains`.
 - **External content is labelled**: both tools prefix their output with an untrusted-data notice and a
   cite-your-sources instruction, so page text never reads like a system instruction.
 - **Ranking is Bing's; filtering and ordering are ours.** Homepage/list detection, the blocklists,

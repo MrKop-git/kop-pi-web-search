@@ -96,6 +96,8 @@ console.log(`dedupe       first=${first.results.length} again=${again.results.le
 assert(again.meta.dedupeWindowMinutes === 10, "dedupe window reported");
 assert(repeats > 0 || again.results.every((r) => r.seen), "repeat call dropped or flagged the seen pages");
 assert(again.results.length <= first.results.length, "no growth from a repeat call");
+assert(String(again.meta.hint).includes("窗口内给过"), `repeat call should hint about the repeats, got: ${again.meta.hint}`);
+console.log(`hint         ${String(again.meta.hint).slice(0, 60)}...`);
 const off = (await search.execute("t6c", { query: "sqlite-vec 向量检索", count: 5, dedupeWindowMinutes: 0 }, signal(), noop, {})).structuredContent;
 assert(off.results.every((r) => !r.seen), "window 0 disables the dedupe");
 

@@ -200,6 +200,7 @@ const SearchPackageSchema = Type.Object({
 		excludeDomains: Type.Union([Type.Array(Type.String()), Type.Null()]),
 		dedupeWindowMinutes: Type.Union([Type.Integer(), Type.Null()]),
 		repeated: Type.Integer({ description: "因窗口内已返回过而被丢弃的条数" }),
+		hint: Type.Union([Type.String(), Type.Null()], { description: "下一轮建议：结果不足或大量重复时给出，告诉模型该换词还是放宽过滤" }),
 		timings: Type.Object({
 			serpMs: Type.Integer(),
 			contentMs: Type.Integer(),
@@ -458,6 +459,7 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 			"Put alternative phrasings and English/Chinese variants in queries=[] rather than calling web_search repeatedly: one call saves round-trips, though Bing pacing still costs ≥1.2 s per query (they run in parallel but that host is throttled).",
 			"Keep a call inside a couple of seconds by default; pass budgetMs only to tighten that further.",
 			"Results you were already given in the last few minutes are dropped as repeats (see meta.repeated and the dropped reasons) — do not re-run the same query to see them again; read the page you actually need with web_fetch instead.",
+			"When a search comes back short or mostly repeats, meta.hint says what to change: refine with queries=[...] (2-4 phrasings, Chinese and English both) or relax recencyDays/domains — repeating the identical query wastes a turn.",
 		],
 		parameters: WebSearchParams,
 		outputSchema: SearchPackageSchema,
@@ -468,8 +470,10 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 			const res = await client.request({ cmd: "search", ...(params as Record<string, unknown>) });
 			if (res.error) throw new Error(res.error);
 			const pkg = res as unknown as Record<string, unknown>;
+			const hint = (pkg.meta as { hint?: string | null } | undefined)?.hint;
+			const tail = hint ? `\n\n[hint] ${hint}` : "";
 			return {
-				content: [{ type: "text", text: `${EXTERNAL_CONTENT_NOTICE}\n\n${JSON.stringify(pkg, null, 2)}\n\n${CITE_INSTRUCTION}` }],
+				content: [{ type: "text", text: `${EXTERNAL_CONTENT_NOTICE}\n\n${JSON.stringify(pkg, null, 2)}${tail}\n\n${CITE_INSTRUCTION}` }],
 				structuredContent: pkg,
 				details: pkg,
 			};

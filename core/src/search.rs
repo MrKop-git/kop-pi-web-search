@@ -931,6 +931,22 @@ impl Engine {
         let embed_ms = embed_started.elapsed().as_millis() as u64;
 
         let repeated = kept.iter().filter(|r| r.seen).count();
+        // 下一轮建议：两家对标产品都只把「截断」当文案，没有把结果形状转成可执行的下一步
+        let hint = {
+            let mut parts: Vec<String> = Vec::new();
+            let repeat_drops = dropped.iter().filter(|d| d.reason.contains("已返回过")).count();
+            let total_repeats = repeated + repeat_drops;
+            if total_repeats > 0 {
+                parts.push(format!("{total_repeats} 条已在 {dedupe_window} 分钟窗口内给过（见 dropped）；要新内容请换说法或换站点，别重复同一查询"));
+            }
+            if kept.len() < count && total_repeats == 0 {
+                parts.push(format!(
+                    "只凑到 {}/{count} 条：可放宽 recencyDays/domains，或用 queries=[...] 一次给 2–4 种说法（中英各一份也行）",
+                    kept.len()
+                ));
+            }
+            if parts.is_empty() { None } else { Some(parts.join("；")) }
+        };
         let fetched_pages = kept.iter().filter(|r| r.content.as_ref().map(|c| c.ok).unwrap_or(false)).count();
         let failed_pages = kept.iter().filter(|r| r.content.is_some() && !r.content.as_ref().unwrap().ok).count();
 
@@ -957,6 +973,7 @@ impl Engine {
                 exclude_domains: if exclude_domains.is_empty() { None } else { Some(exclude_domains.clone()) },
                 dedupe_window_minutes: if dedupe_window > 0 { Some(dedupe_window) } else { None },
                 repeated,
+                hint,
                 timings: Timings {
                     serp_ms,
                     content_ms,

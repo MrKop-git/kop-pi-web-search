@@ -150,6 +150,8 @@ pub struct PackageMeta {
     pub dedupe_window_minutes: Option<u32>,
     /// 因「窗口内已返回过」而被丢弃的条数
     pub repeated: usize,
+    /// 给模型的下一轮建议（结果不足/大量重复时给出），没有就是 null
+    pub hint: Option<String>,
     pub timings: Timings,
 }
 
