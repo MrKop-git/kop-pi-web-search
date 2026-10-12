@@ -255,8 +255,8 @@ the invisible-content rule (`hidden` / `aria-hidden` / `input[type=hidden]` / in
 in-label `region*.foo.com`) for allow/deny filters, and the search → open → find decomposition that
 our `queries` / `web_fetch(find=)` mirrors.
 
-**Deliberately different**: neither of them synthesises an answer locally either, but both can lean on a
-search service that does — we don't, because it would mean an API key and a quota. TLS/HTTP2
+**Deliberately different**: neither harness synthesises an answer locally, but both can lean on a search
+service that does; we won't, because that means an API key and a quota. TLS/HTTP2
 fingerprints are still native-tls, so identity rotation buys session continuity, not Cloudflare-proof
 impersonation. Redirects are validated but not pinned to an address, and cross-origin redirects are
 followed (up to five), where DeepSeek Harness refuses them.
