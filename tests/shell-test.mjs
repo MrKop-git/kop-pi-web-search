@@ -44,6 +44,12 @@ assert(pkg.results.some((r) => r.published), "some results carry a date");
 assert(typeof pkg.meta.timings.totalMs === "number", "timings present");
 assert(pkg.results[0].weight > 0, "weight present");
 assert(res.content[0].text.includes("untrusted"), "untrusted notice in the text output");
+assert(res.content[0].text.includes("高置信"), "text groups results by confidence");
+if (pkg.meta.lowConfidence > 0) {
+	assert(res.content[0].text.includes("低置信候选"), "low-confidence results are listed separately");
+}
+assert(res.content[0].text.length < JSON.stringify(pkg).length, "rendered text is smaller than the raw JSON");
+assert(res.content[0].text.includes("- ["), "results are rendered as markdown links");
 assert(res.content[0].text.includes("markdown links"), "cite instruction in the text output");
 assert(JSON.stringify(res.structuredContent) === JSON.stringify(res.details), "structuredContent mirrors details");
 

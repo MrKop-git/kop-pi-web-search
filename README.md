@@ -123,8 +123,12 @@ suffixes or `*` / `**` globs), `budgetMs`, `dedupeWindowMinutes` (10; 0 disables
 suggested next step when high-confidence results are scarce or the batch was mostly repeats.
 `web_fetch` parameters: `url`, `maxChars` (20000), `find`, `fromLine`.
 
-Output is a JSON package — `{ query, engine, fetchedAt, results[], dropped[], meta{} }` —
-where every result carries `weight`, `via`, `published` (YYYY-MM-DD or null), `recency`
+The reply the model reads groups results by confidence — a **高置信** list first, then the
+**低置信候选** underneath, each line carrying title link, confidence/relevance/support, date, weight and
+via, plus a one-line meta footer (engine, sort, timing, dropped reasons) — which is roughly half the
+tokens of dumping the package. Output is a JSON package — `{ query, engine, fetchedAt, results[], dropped[], meta{} }` —
+and that JSON stays available as the tool's structured output. Every result carries `weight`, `via`,
+`published` (YYYY-MM-DD or null), `recency`
 (0–1, half-life 365 days, 0.5 when undated), `confidence`, `relevance`, `support` and the
 fetched `content`. `meta.timings` breaks the run down per stage.
 

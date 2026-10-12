@@ -283,6 +283,95 @@ const WebFetchParams = Type.Object({
 	fromLine: Type.Optional(Type.Integer({ description: "从第几行开始返回（1 起），配合 totalLines 做分页阅读", minimum: 1 })),
 });
 
+// ---------------------------------------------------------------- model-facing text
+
+interface RankedResult {
+	rank: number;
+	title: string;
+	url: string;
+	weight: number;
+	weightSource?: string | null;
+	via: string;
+	snippet?: string;
+	published?: string | null;
+	confidence?: number | null;
+	confidenceBasis?: string | null;
+	relevance?: number | null;
+	support?: number | null;
+	seen?: boolean;
+	content?: { ok: boolean; coreText?: string; chars?: number; error?: string | null } | null;
+}
+
+interface SearchPackage {
+	query: string;
+	engine: string;
+	results: RankedResult[];
+	dropped: Array<{ title: string; url: string; weight: number; reason: string }>;
+	meta: Record<string, unknown> & {
+		highConfidence?: number;
+		lowConfidence?: number;
+		repeated?: number;
+		dedupeWindowMinutes?: number | null;
+		sortBy?: string;
+		timings?: { totalMs?: number };
+		hint?: string | null;
+	};
+}
+
+/** 高置信阈值，与核心里的一致 */
+const HIGH_CONFIDENCE = 0.55;
+
+function renderResultLine(result: RankedResult): string {
+	const bits = [
+		result.confidence !== null && result.confidence !== undefined ? `conf ${result.confidence.toFixed(2)}` : null,
+		result.relevance !== null && result.relevance !== undefined ? `rel ${result.relevance.toFixed(2)}` : null,
+		result.support !== null && result.support !== undefined ? `印证 ${result.support}` : null,
+		result.published ?? null,
+		`w ${result.weight}`,
+		result.via,
+		result.seen ? "seen" : null,
+	].filter(Boolean);
+	let block = `- [${result.title}](${result.url}) — ${bits.join(" · ")}`;
+	if (result.snippet) block += `\n  ${result.snippet}`;
+	if (result.content?.coreText) block += `\n  正文（${result.content.chars} 字）：${result.content.coreText}`;
+	else if (result.content?.error) block += `\n  正文失败：${result.content.error}`;
+	return block;
+}
+
+/**
+ * 结果按置信分档渲染：模型一眼看出哪些是可信来源、哪些只是候选。
+ * 完整 JSON 仍在 structuredContent 里（UI 与程序化使用不受影响）。
+ */
+function renderSearch(pkg: SearchPackage): string {
+	const high = pkg.results.filter((r) => (r.confidence ?? 0) >= HIGH_CONFIDENCE);
+	const low = pkg.results.filter((r) => (r.confidence ?? 0) < HIGH_CONFIDENCE);
+	const parts: string[] = [EXTERNAL_CONTENT_NOTICE];
+
+	parts.push(`**高置信（≥${HIGH_CONFIDENCE.toFixed(2)}）· ${high.length} 条**`);
+	parts.push(high.length ? high.map(renderResultLine).join("\n") : "（没有）");
+	if (low.length) {
+		parts.push(`\n**低置信候选（<${HIGH_CONFIDENCE.toFixed(2)}）· ${low.length} 条** — 仅作线索；要更硬的来源就换说法（queries=[...]）或限定 domains/minWeight`);
+		parts.push(low.map(renderResultLine).join("\n"));
+	}
+
+	const reasons = new Map<string, number>();
+	for (const item of pkg.dropped) reasons.set(item.reason, (reasons.get(item.reason) ?? 0) + 1);
+	const metaBits = [
+		`引擎 ${pkg.engine}`,
+		`排序 ${pkg.meta.sortBy ?? "time"}`,
+		pkg.meta.timings?.totalMs !== undefined ? `${pkg.meta.timings.totalMs}ms` : null,
+		pkg.meta.repeated ? `重复丢弃 ${pkg.meta.repeated}` : null,
+		pkg.meta.dedupeWindowMinutes ? `去重窗口 ${pkg.meta.dedupeWindowMinutes} 分钟` : null,
+	];
+	if (reasons.size) {
+		metaBits.push(`丢弃 ${pkg.dropped.length}（${[...reasons].map(([reason, count]) => `${reason}×${count}`).join("、")}）`);
+	}
+	parts.push(`\n_${metaBits.filter(Boolean).join(" · ")}_`);
+	if (pkg.meta.hint) parts.push(`[hint] ${pkg.meta.hint}`);
+	parts.push(CITE_INSTRUCTION);
+	return parts.join("\n\n");
+}
+
 // ---------------------------------------------------------------- core client
 
 interface CoreResponse {
@@ -465,7 +554,9 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 			"Put alternative phrasings and English/Chinese variants in queries=[] rather than calling web_search repeatedly: one call saves round-trips, though Bing pacing still costs ≥1.2 s per query (they run in parallel but that host is throttled).",
 			"Keep a call inside a couple of seconds by default; pass budgetMs only to tighten that further.",
 			"Results you were already given in the last few minutes are dropped as repeats (see meta.repeated and the dropped reasons) — do not re-run the same query to see them again; read the page you actually need with web_fetch instead.",
-			"You do not need page bodies to judge a result: every result carries confidence (from snippet text by default, from the page when you fetched it), confidenceBasis says which, and meta.highConfidence tells you how many cleared 0.55. When the hint says high-confidence results are scarce, change the query (queries=[...]) or constrain the source (domains/minWeight) instead of paging further.",
+			"You do not need page bodies to judge a result: every result carries confidence (from snippet text by default, from the page when you fetched it), confidenceBasis says which, and meta.highConfidence tells you how many cleared 0.55. The reply lists high-confidence results first and low-confidence ones as candidates underneath — treat the latter as leads, not answers.",
+			"When high-confidence results are scarce, change the query (queries=[...]) or constrain the source instead of paging further: domains/minWeight narrow it, and minConfidence (e.g. 0.55) drops the weak tail outright when you would rather see fewer, sturdier results.",
+			"Search results are title, URL, date, confidence and snippet only — the body text under a result appears when includeContent was on. If you need it for a specific page, web_fetch it (find= to jump to the relevant lines).",
 		],
 		parameters: WebSearchParams,
 		outputSchema: SearchPackageSchema,
@@ -475,11 +566,9 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const res = await client.request({ cmd: "search", ...(params as Record<string, unknown>) });
 			if (res.error) throw new Error(res.error);
-			const pkg = res as unknown as Record<string, unknown>;
-			const hint = (pkg.meta as { hint?: string | null } | undefined)?.hint;
-			const tail = hint ? `\n\n[hint] ${hint}` : "";
+			const pkg = res as unknown as SearchPackage;
 			return {
-				content: [{ type: "text", text: `${EXTERNAL_CONTENT_NOTICE}\n\n${JSON.stringify(pkg, null, 2)}${tail}\n\n${CITE_INSTRUCTION}` }],
+				content: [{ type: "text", text: renderSearch(pkg) }],
 				structuredContent: pkg,
 				details: pkg,
 			};
