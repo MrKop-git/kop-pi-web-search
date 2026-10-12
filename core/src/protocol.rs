@@ -29,6 +29,9 @@ pub struct SearchParams {
     pub content_chars: Option<usize>,
     #[serde(default, rename = "minWeight")]
     pub min_weight: Option<f32>,
+    /// `time`（默认，按发布时间倒序）或 `relevance`（保持引擎原序）
+    #[serde(default, rename = "sortBy")]
+    pub sort_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -44,6 +47,8 @@ pub struct PageContent {
     pub title: String,
     #[serde(rename = "coreText")]
     pub core_text: String,
+    /// 页面自带时间（meta/JSON-LD），用于给没有日期的搜索结果补标签
+    pub published: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub chars: usize,
@@ -59,10 +64,14 @@ pub struct PackagedResult {
     pub weight_source: Option<String>,
     pub via: String,
     pub snippet: String,
+    /// 发布时间（YYYY-MM-DD）；来源没有就是 null
+    pub published: Option<String>,
     pub content: Option<PageContent>,
     pub confidence: Option<f32>,
     pub relevance: Option<f32>,
     pub support: Option<usize>,
+    /// 新鲜度 0~1（半衰期 365 天，无日期为中性 0.5）
+    pub recency: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +111,8 @@ pub struct PackageMeta {
     #[serde(rename = "failedPages")]
     pub failed_pages: usize,
     pub sites: Option<Vec<String>>,
+    #[serde(rename = "sortBy")]
+    pub sort_by: String,
     pub timings: Timings,
 }
 

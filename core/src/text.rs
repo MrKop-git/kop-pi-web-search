@@ -9,6 +9,201 @@ pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+    /// 发布时间（YYYY-MM-DD）；取不到就是 None
+    pub published: Option<String>,
+}
+
+// ---------------------------------------------------------------- dates
+
+fn take_num(s: &str) -> Option<(i64, usize)> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some((digits.parse().ok()?, digits.len()))
+}
+
+/// 年/月/日 → YYYY-MM-DD；越界（月份/日期/年份不合理）返回 None
+pub fn ymd(y: i64, m: i64, d: i64) -> Option<String> {
+    if (1900..=2200).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d) {
+        Some(format!("{y:04}-{m:02}-{d:02}"))
+    } else {
+        None
+    }
+}
+
+/// 从一段文本里挑出第一个日期，归一成 YYYY-MM-DD。
+/// 认 `2026-03-05`、`2026/3/5`、`2026年3月5日`、`Mar 5, 2026`、`5 March 2026`。
+pub fn normalize_date(raw: &str) -> Option<String> {
+    const MONTHS: [(&str, &str); 12] = [
+        ("jan", "january"),
+        ("feb", "february"),
+        ("mar", "march"),
+        ("apr", "april"),
+        ("may", "may"),
+        ("jun", "june"),
+        ("jul", "july"),
+        ("aug", "august"),
+        ("sep", "september"),
+        ("oct", "october"),
+        ("nov", "november"),
+        ("dec", "december"),
+    ];
+    for (i, _) in raw.char_indices() {
+        let rest = &raw[i..];
+        let Some((first, len)) = take_num(rest) else { continue };
+        let after = &rest[len..];
+        let parsed = if let Some(r2) = after.strip_prefix('-').or_else(|| after.strip_prefix('/')) {
+            take_num(r2).and_then(|(m, lm)| {
+                let r3 = &r2[lm..];
+                r3.strip_prefix('-')
+                    .or_else(|| r3.strip_prefix('/'))
+                    .and_then(take_num)
+                    .and_then(|(d, _)| ymd(first, m, d))
+            })
+        } else if let Some(r2) = after.strip_prefix('年') {
+            take_num(r2).and_then(|(m, lm)| {
+                r2[lm..].strip_prefix('月').and_then(take_num).and_then(|(d, _)| ymd(first, m, d))
+            })
+        } else {
+            None
+        };
+        if parsed.is_some() {
+            return parsed;
+        }
+    }
+    // 英文月份：Mar 5, 2026 / 5 March 2026（数字要紧挨着月份，免得 "may be 5 of 2026" 误判）
+    let lower = raw.to_ascii_lowercase();
+    let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphabetic());
+    let mut mentions: Vec<(usize, usize, i64)> = Vec::new();
+    for (mi, (abbr, full)) in MONTHS.iter().enumerate() {
+        for needle in [*full, *abbr] {
+            let Some(pos) = lower.find(needle) else { continue };
+            let end = pos + needle.len();
+            // 全称一定带边界；缩写要求后面不是字母（"march" 里的 "mar" 不算）
+            let ok_after = needle == *full || boundary(lower[end..].chars().next());
+            if boundary(lower[..pos].chars().next_back()) && ok_after {
+                mentions.push((pos, end, mi as i64 + 1));
+            }
+        }
+    }
+    mentions.sort();
+    for (pos, end, m) in mentions {
+        let head = lower[..pos].trim_end();
+        let head = &head[head.len().saturating_sub(6)..];
+        let tail = &lower[end..lower.len().min(end + 16)];
+        let day_before: Option<i64> = {
+            let digits: String = head.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+            digits.chars().rev().collect::<String>().parse().ok()
+        };
+        let parsed = match day_before {
+            // 5 March 2026：月份前是日，紧跟的数字是年
+            Some(day) => number_after(tail).and_then(|(year, start, _)| {
+                if start <= 3 { ymd(year, m, day) } else { None }
+            }),
+            // Mar 5, 2026：月份后紧跟日、日之后紧跟年
+            None => number_after(tail).and_then(|(day, start, end)| {
+                if start > 2 {
+                    return None;
+                }
+                number_after(&tail[end..]).and_then(|(year, ystart, _)| {
+                    if ystart <= 3 { ymd(year, m, day) } else { None }
+                })
+            }),
+        };
+        if parsed.is_some() {
+            return parsed;
+        }
+    }
+    None
+}
+
+/// 跳过非数字后取一个整数，返回（值，起始字节下标，结束字节下标）
+fn number_after(s: &str) -> Option<(i64, usize, usize)> {
+    let start = s.find(|c: char| c.is_ascii_digit())?;
+    let (value, len) = take_num(&s[start..])?;
+    Some((value, start, start + len))
+}
+
+/// 纪元秒 → YYYY-MM-DD（civil_from_days，省掉 chrono 依赖）
+pub fn date_from_epoch_secs(secs: i64) -> String {
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    (era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy) - 719_468
+}
+
+fn today() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
+}
+
+fn parse_ymd(date: &str) -> Option<(i64, i64, i64)> {
+    let mut parts = date.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    Some((y, m, d))
+}
+
+/// 新鲜度：半衰期 365 天（今天 = 1，一年前 = 0.5，两年前 = 0.25）；无日期给中性 0.5
+pub fn recency_score(published: Option<&str>) -> f32 {
+    let age = published.and_then(parse_ymd).map(|(y, m, d)| today() - days_from_civil(y, m, d));
+    match age {
+        Some(days) => 0.5f32.powf(days.max(0) as f32 / 365.0),
+        None => 0.5,
+    }
+}
+
+/// 页面自带时间：`<meta property="article:published_time">`、JSON-LD `datePublished`、`<time datetime>`
+pub fn date_from_html(html: &str) -> Option<String> {
+    const NEEDLES: [&str; 5] = [
+        "article:published_time",
+        "datePublished",
+        "article:modified_time",
+        "dateModified",
+        "<time",
+    ];
+    for needle in NEEDLES {
+        let Some(pos) = html.find(needle) else { continue };
+        let window = &html[pos..html.len().min(pos + 300)];
+        if let Some(date) = normalize_date(window) {
+            return Some(date);
+        }
+    }
+    None
+}
+
+/// SERP 单条结果里的时间：绝对日期优先，`3 天前` / `5 days ago` 这类相对时间按今天折算
+pub fn date_from_serp_chunk(chunk: &str) -> Option<String> {
+    let text = strip_tags(chunk);
+    if let Some(date) = normalize_date(&text) {
+        return Some(date);
+    }
+    for (needle, unit) in [("天前", 1i64), ("小时前", 0), ("分钟前", 0), ("days ago", 1), ("hours ago", 0), ("minutes ago", 0)] {
+        let Some(pos) = text.find(needle) else { continue };
+        let head: String = text[..pos].chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+        let n: i64 = head.chars().rev().collect::<String>().parse().unwrap_or(0);
+        return Some(date_from_epoch_secs((today() - n * unit) * 86_400));
+    }
+    None
 }
 
 // ---------------------------------------------------------------- entities
@@ -109,6 +304,7 @@ pub fn parse_bing_results(html: &str) -> Vec<SearchResult> {
             title: strip_tags(&raw_title),
             url,
             snippet: snippet_from_chunk(chunk),
+            published: date_from_serp_chunk(chunk),
         });
     }
     out
@@ -159,6 +355,21 @@ pub fn looks_like_captcha(html: &str) -> bool {
         "sb_form_captcha",
         "请解决以下难题",
         "Enter the characters you see",
+    ];
+    NEEDLES.iter().any(|n| html.contains(n))
+}
+
+/// 反爬中间页（Cloudflare / Anubis）：抓到的是验证提示，不是正文
+pub fn looks_like_challenge(html: &str) -> bool {
+    const NEEDLES: [&str; 8] = [
+        "Just a moment...",
+        "Verifying your browser",
+        "cf-chl-",
+        "_cf_chl_opt",
+        "challenge-platform",
+        "Making sure you&#39;re not a bot",
+        "Making sure you're not a bot",
+        "Attention Required! | Cloudflare",
     ];
     NEEDLES.iter().any(|n| html.contains(n))
 }
@@ -518,7 +729,8 @@ pub fn classify_page_url(url: &str) -> PageKind {
     if LIST_SEGMENTS.contains(&last.to_ascii_lowercase().as_str()) {
         return PageKind::List;
     }
-    if trailing_slash && segments.len() == 1 {
+    // 单段 + 结尾斜杠通常是站点/栏目根；段里带数字的多是论文号（ACL Anthology 的 /2024.acl-long.1/）
+    if trailing_slash && segments.len() == 1 && !segments[0].chars().any(|c| c.is_ascii_digit()) {
         return PageKind::Homepage;
     }
     if trailing_slash && segments.len() == 2 && is_locale(segments[0]) {

@@ -38,6 +38,7 @@ const PageContentSchema = Type.Object({
 	ok: Type.Boolean(),
 	title: Type.String(),
 	coreText: Type.String(),
+	published: Type.Union([Type.String(), Type.Null()], { description: "页面自带时间（YYYY-MM-DD）" }),
 	chars: Type.Integer(),
 	error: Type.Union([Type.String(), Type.Null()]),
 });
@@ -50,10 +51,12 @@ const PackagedResultSchema = Type.Object({
 	weightSource: Type.Union([Type.String(), Type.Null()]),
 	via: Type.String(),
 	snippet: Type.String(),
+	published: Type.Union([Type.String(), Type.Null()], { description: "发布时间（YYYY-MM-DD），取不到为 null" }),
 	content: Type.Union([PageContentSchema, Type.Null()]),
 	confidence: Type.Union([Type.Number(), Type.Null()]),
 	relevance: Type.Union([Type.Number(), Type.Null()]),
 	support: Type.Union([Type.Integer(), Type.Null()]),
+	recency: Type.Union([Type.Number(), Type.Null()], { description: "新鲜度 0~1，半衰期 365 天，无日期为 0.5" }),
 });
 
 const SearchPackageSchema = Type.Object({
@@ -79,6 +82,7 @@ const SearchPackageSchema = Type.Object({
 		fetchedPages: Type.Integer(),
 		failedPages: Type.Integer(),
 		sites: Type.Union([Type.Array(Type.String()), Type.Null()]),
+		sortBy: Type.String(),
 		timings: Type.Object({
 			serpMs: Type.Integer(),
 			contentMs: Type.Integer(),
@@ -109,13 +113,20 @@ const WebSearchParams = Type.Object({
 	sites: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"站内直达：站点别名/标签/域名（如 [\"github\"]、[\"代码\",\"csdn\"]）。提供后跳过搜索引擎，只搜这些站（github/npm/crates/mdn/stackoverflow/hn/juejin/csdn/openalex/crossref/arxiv/gitlab 走原生 API）",
+				"站内直达：站点别名/标签/域名（如 [\"github\"]、[\"代码\",\"csdn\"]、[\"顶会\"]、[\"期刊\"]）。提供后跳过搜索引擎，只搜这些站" +
+				"（github/gitlab/npm/crates/mdn/stackoverflow/hn/juejin/csdn/openalex/crossref/arxiv/openreview 走原生 API，" +
+				"tse/tosem/toplas/emse/tpami/jmlr/aij/tacl/cl 等头部期刊走 OpenAlex 按 ISSN 检索，其余用 site: 检索）",
 		}),
 	),
 	includeContent: Type.Optional(Type.Boolean({ description: "抓取结果页并附核心文本（默认 true）" })),
 	contentTop: Type.Optional(Type.Integer({ description: "并发抓取的结果条数（默认 8；并行抓取，多抓不额外增加等待）", minimum: 0, maximum: 20 })),
 	contentChars: Type.Optional(Type.Integer({ description: "每条结果附带的核心文本字数（默认 1000）", minimum: 200, maximum: 5000 })),
 	minWeight: Type.Optional(Type.Number({ description: "信源权重下限（0~1），低于该权重的结果丢弃", minimum: 0, maximum: 1 })),
+	sortBy: Type.Optional(
+		Type.Union([Type.Literal("time"), Type.Literal("relevance")], {
+			description: "结果排序：time（默认）按发布时间倒序、越新越前，没有日期的排在后面；relevance 保持引擎原序",
+		}),
+	),
 });
 
 const WebFetchParams = Type.Object({
@@ -239,7 +250,8 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 			"Search the web (Bing SERP or site-direct APIs) and concurrently fetch the top result pages, returning core text plus a source-trust weight and a confidence score. " +
 			"Only content pages are returned — homepages and list/index pages are dropped; junk sources are excluded via the blacklist. " +
 			"Pass sites=[\"github\",\"csdn\"] to skip the search engine and search those sites directly. " +
-			"Returns a JSON package: results (with weight, via, confidence, relevance, support and fetched core text), dropped items and stage timings.",
+			"Every result carries its publish date (published) and a freshness score (recency), and results are sorted newest-first unless sortBy=\"relevance\". " +
+			"Returns a JSON package: results (with weight, via, published, confidence, relevance, support and fetched core text), dropped items and stage timings.",
 		parameters: WebSearchParams,
 		outputSchema: SearchPackageSchema,
 		namespace: { name: "web", description: "Web search and page fetching (Rust core)" },

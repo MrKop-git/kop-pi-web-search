@@ -75,6 +75,27 @@ const DEFAULT_DOMAINS: &[(&str, f32)] = &[
     ("nature.com", 0.95),
     ("science.org", 0.95),
     ("ncbi.nlm.nih.gov", 0.95),
+    // 顶会与期刊（大模型 / 机器学习）
+    ("openreview.net", 0.95),
+    ("proceedings.neurips.cc", 0.95),
+    ("papers.nips.cc", 0.95),
+    ("mlr.press", 0.95),
+    ("aclanthology.org", 0.95),
+    ("jmlr.org", 0.95),
+    ("direct.mit.edu", 0.9),
+    // 顶会与期刊（软件工程 / 系统 / 编程语言）
+    ("usenix.org", 0.9),
+    ("sigplan.org", 0.9),
+    ("conf.researchr.org", 0.85),
+    ("springer.com", 0.85),
+    ("sciencedirect.com", 0.85),
+    // 文献索引
+    ("dblp.org", 0.9),
+    ("semanticscholar.org", 0.8),
+    // 中文期刊
+    ("jos.org.cn", 0.9),
+    ("cjc.ict.ac.cn", 0.85),
+    ("ccf.org.cn", 0.8),
     ("stackoverflow.com", 0.9),
     ("wikipedia.org", 0.9),
     ("kubernetes.io", 0.9),
@@ -163,6 +184,30 @@ fn default_sites() -> Vec<(String, SiteEntry)> {
         ("openalex".into(), site("openalex.org", &["学术", "论文", "paper"], "openalex", None)),
         ("crossref".into(), site("doi.org", &["文献", "doi"], "crossref", None)),
         ("arxiv".into(), site("arxiv.org", &["论文", "预印本"], "arxiv", None)),
+        // 顶会与期刊：大模型 / 机器学习
+        ("openreview".into(), site("openreview.net", &["顶会", "大模型", "机器学习", "iclr", "neurips", "tmlr", "评审"], "openreview", None)),
+        ("neurips".into(), site("proceedings.neurips.cc", &["顶会", "大模型", "机器学习", "neurips"], "bing-site", None)),
+        ("icml".into(), site("mlr.press", &["顶会", "大模型", "机器学习", "icml"], "bing-site", None)),
+        ("aclanthology".into(), site("aclanthology.org", &["顶会", "大模型", "自然语言处理", "acl"], "bing-site", None)),
+        // 头部期刊：OpenAlex 按 ISSN 检索（site 字段放 ISSN）
+        ("jmlr".into(), site("jmlr.org", &["期刊", "机器学习", "jmlr"], "openalex-venue", Some("1532-4435"))),
+        ("tpami".into(), site("ieeexplore.ieee.org", &["期刊", "机器学习", "tpami"], "openalex-venue", Some("0162-8828"))),
+        ("aij".into(), site("sciencedirect.com", &["期刊", "人工智能", "aij"], "openalex-venue", Some("0004-3702"))),
+        ("tacl".into(), site("direct.mit.edu", &["期刊", "大模型", "自然语言处理", "tacl"], "openalex-venue", Some("2307-387X"))),
+        ("cl".into(), site("direct.mit.edu", &["期刊", "自然语言处理", "computational linguistics"], "openalex-venue", Some("0891-2017"))),
+        ("nature-mi".into(), site("nature.com", &["期刊", "机器学习", "nature machine intelligence"], "openalex-venue", Some("2522-5839"))),
+        // 顶会与期刊：软件工程 / 系统 / 编程语言
+        ("tse".into(), site("ieeexplore.ieee.org", &["期刊", "软件工程", "tse"], "openalex-venue", Some("0098-5589"))),
+        ("tosem".into(), site("dl.acm.org", &["期刊", "软件工程", "tosem"], "openalex-venue", Some("1049-331X"))),
+        ("toplas".into(), site("dl.acm.org", &["期刊", "编程语言", "toplas"], "openalex-venue", Some("0164-0925"))),
+        ("emse".into(), site("link.springer.com", &["期刊", "软件工程", "emse"], "openalex-venue", Some("1382-3256"))),
+        ("researchr".into(), site("conf.researchr.org", &["顶会", "软件工程", "icse", "fse", "ase"], "bing-site", None)),
+        ("sigplan".into(), site("sigplan.org", &["顶会", "编程语言", "pldi", "popl", "oopsla"], "bing-site", None)),
+        ("usenix".into(), site("usenix.org", &["顶会", "系统", "osdi", "atc"], "bing-site", None)),
+        // 中文头部期刊与文献索引
+        ("jos".into(), site("jos.org.cn", &["期刊", "中文期刊", "软件学报"], "openalex-venue", Some("1000-9825"))),
+        ("cjc".into(), site("cjc.ict.ac.cn", &["期刊", "中文期刊", "计算机学报"], "openalex-venue", Some("0254-4164"))),
+        ("dblp".into(), site("dblp.org", &["文献索引", "ccf", "论文"], "bing-site", None)),
         ("docs.rs".into(), site("docs.rs", &["rust 文档", "api 文档"], "bing-site", None)),
         ("zhihu".into(), site("zhihu.com", &["知乎"], "bing-site", None)),
     ]
@@ -359,10 +404,13 @@ pub fn relevance_score(query: &[f32], page: &[f32], semantic: bool) -> f32 {
     (0.6 * coverage + 0.4 * cosine).min(1.0)
 }
 
-/// 置信度 = 相关性 40% + 信源权重 25% + 多源印证 35%（3 源封顶）
-pub fn score_confidence(relevance: f32, source_weight: f32, support: usize) -> f32 {
+/// 置信度 = 相关性 35% + 信源权重 20% + 多源印证 30% + 新鲜度 15%（3 源封顶）
+pub fn score_confidence(relevance: f32, source_weight: f32, support: usize, recency: f32) -> f32 {
     let support_score = (support.min(3) as f32) / 3.0;
-    let raw = 0.4 * clamp01(relevance) + 0.25 * clamp01(source_weight) + 0.35 * support_score;
+    let raw = 0.35 * clamp01(relevance)
+        + 0.20 * clamp01(source_weight)
+        + 0.30 * support_score
+        + 0.15 * clamp01(recency);
     (clamp01(raw) * 100.0).round() / 100.0
 }
 

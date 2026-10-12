@@ -95,6 +95,8 @@ impl Store {
             let weights = load_or_default(legacy_json);
             seed(&conn, &weights)?;
         }
+        // 新版本新增的内置信源也要进老库（旧版 web-sources.json 里没有这些）
+        seed_new_defaults(&conn)?;
         Ok(Self { conn, vec_enabled })
     }
 
@@ -351,21 +353,38 @@ pub fn parse_weights_json(value: &serde_json::Value) -> Option<SourceWeights> {
 }
 
 fn seed(conn: &Connection, w: &SourceWeights) -> Result<()> {
-    conn.execute("insert or replace into settings(key, value) values ('defaultWeight', ?)", [w.default_weight.to_string()])?;
+    conn.execute("insert or ignore into settings(key, value) values ('defaultWeight', ?)", [w.default_weight.to_string()])?;
     for (host, weight) in &w.domains {
-        conn.execute("insert or replace into sources(host, weight) values (?, ?)", params![host, *weight as f64])?;
+        conn.execute("insert or ignore into sources(host, weight) values (?, ?)", params![host, *weight as f64])?;
     }
     for host in &w.blocked_domains {
-        conn.execute("insert or replace into blocked_domains(host) values (?)", [host])?;
+        conn.execute("insert or ignore into blocked_domains(host) values (?)", [host])?;
     }
     for pattern in &w.blocked_patterns {
-        conn.execute("insert or replace into blocked_patterns(pattern) values (?)", [pattern])?;
+        conn.execute("insert or ignore into blocked_patterns(pattern) values (?)", [pattern])?;
     }
     for (alias, entry) in &w.sites {
         conn.execute(
-            "insert or replace into sites(alias, domain, tags, kind, site) values (?, ?, ?, ?, ?)",
+            "insert or ignore into sites(alias, domain, tags, kind, site) values (?, ?, ?, ?, ?)",
             params![alias, entry.domain, serde_json::to_string(&entry.tags)?, entry.search.kind, entry.search.site],
         )?;
     }
+    Ok(())
+}
+
+/// 内置种子版本：新增内置信源时 +1，老库在打开时补齐缺失的行（已有行不动）
+const SEED_VERSION: i64 = 2;
+
+fn seed_new_defaults(conn: &Connection) -> Result<()> {
+    let current: i64 = conn
+        .query_row("select value from settings where key='seedVersion'", [], |r| r.get::<_, String>(0))
+        .optional()?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if current >= SEED_VERSION {
+        return Ok(());
+    }
+    seed(conn, &SourceWeights::default())?;
+    conn.execute("insert or replace into settings(key, value) values ('seedVersion', ?)", [SEED_VERSION.to_string()])?;
     Ok(())
 }

@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
                 content_top: None,
                 content_chars: None,
                 min_weight: None,
+                sort_by: None,
             };
             match engine.search(params).await {
                 Ok(pkg) => println!("{}", serde_json::to_string_pretty(&pkg)?),
@@ -155,7 +156,36 @@ async fn run_selftest(engine: &mut Engine) -> Result<()> {
     let v2 = weights::embed_text("SQLite 向量扩展 sqlite-vec");
     let v3 = weights::embed_text("今天天气不错，适合钓鱼");
     check("哈希嵌入: 相关 > 无关", weights::cosine_sim(&v1, &v2) > weights::cosine_sim(&v1, &v3), format!("{:.3} vs {:.3}", weights::cosine_sim(&v1, &v2), weights::cosine_sim(&v1, &v3)));
-    check("置信度: 满分 1 / 无印证封顶 0.65", weights::score_confidence(1.0, 1.0, 3) == 1.0 && weights::score_confidence(1.0, 1.0, 0) == 0.65, String::new());
+    check(
+        "置信度: 满分 1 / 无印证且无日期封顶 0.63",
+        weights::score_confidence(1.0, 1.0, 3, 1.0) == 1.0 && weights::score_confidence(1.0, 1.0, 0, 0.5) == 0.63,
+        format!("{} / {}", weights::score_confidence(1.0, 1.0, 3, 1.0), weights::score_confidence(1.0, 1.0, 0, 0.5)),
+    );
+
+    check(
+        "日期: 各种写法归一",
+        text::normalize_date("2026年3月5日") == Some("2026-03-05".into())
+            && text::normalize_date("发布于 2024/11/5") == Some("2024-11-05".into())
+            && text::normalize_date("Mar 5, 2026 — 更新") == Some("2026-03-05".into())
+            && text::normalize_date("published 5 March 2026") == Some("2026-03-05".into())
+            && text::normalize_date("没有日期的一段话") == None
+            && text::normalize_date("this may be 5 of 2026 items") == None,
+        format!("{:?}", text::normalize_date("2026年3月5日")),
+    );
+    check(
+        "日期: 页面 meta / JSON-LD",
+        text::date_from_html("<meta property=\"article:published_time\" content=\"2025-04-01T10:00:00Z\">") == Some("2025-04-01".into())
+            && text::date_from_html("<script>{\"datePublished\":\"2025-04-02\"}</script>") == Some("2025-04-02".into()),
+        String::new(),
+    );
+    check(
+        "新鲜度: 越近越高、无日期中性",
+        text::recency_score(Some(&text::date_from_epoch_secs(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) - 400 * 86_400,
+        ))) > text::recency_score(Some("2000-01-01"))
+            && text::recency_score(None) == 0.5,
+        String::new(),
+    );
 
     check("SQLite + sqlite-vec 可用", engine.store.vec_enabled(), String::new());
 
@@ -190,6 +220,6 @@ struct SearchResultStub {
 
 impl From<SearchResultStub> for text::SearchResult {
     fn from(s: SearchResultStub) -> Self {
-        text::SearchResult { title: s.title, url: s.url, snippet: String::new() }
+        text::SearchResult { title: s.title, url: s.url, snippet: String::new(), published: None }
     }
 }

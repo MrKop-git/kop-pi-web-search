@@ -195,6 +195,7 @@ impl Fetcher {
                     ok: true,
                     title: cached.title,
                     core_text: cached.core_text.clone(),
+                    published: None,
                     error: if cached.core_text.is_empty() { Some("缓存正文为空".into()) } else { None },
                     chars: cached.core_text.chars().count(),
                 };
@@ -206,6 +207,10 @@ impl Fetcher {
                     return failed(format!("不支持的内容类型 {}", content_type.split(';').next().unwrap_or("")));
                 }
                 let is_html = content_type.contains("text/html") || body.trim_start().starts_with("<!doctype") || body.trim_start().starts_with("<html");
+                if is_html && text::looks_like_challenge(&body) {
+                    return failed("反爬验证页（Cloudflare / Anubis 拦截）".into());
+                }
+                let published = if is_html { text::date_from_html(&body) } else { None };
                 let (title, core) = if is_html {
                     (text::extract_title(&body), text::html_to_text(&body))
                 } else {
@@ -225,7 +230,7 @@ impl Fetcher {
                 if error.is_none() && stored.chars().count() < 200 {
                     error = Some("正文过短（疑似栏目页/空页）".into());
                 }
-                PageContent { ok: true, title, chars: stored.chars().count(), core_text: stored, error }
+                PageContent { ok: true, title, chars: stored.chars().count(), core_text: stored, published, error }
             }
             Ok((status, _, _)) => failed(format!("HTTP {status}")),
             Err(err) => failed(format!("{err}")),
@@ -234,7 +239,7 @@ impl Fetcher {
 }
 
 fn failed(msg: String) -> PageContent {
-    PageContent { ok: false, title: String::new(), core_text: String::new(), error: Some(msg), chars: 0 }
+    PageContent { ok: false, title: String::new(), core_text: String::new(), published: None, error: Some(msg), chars: 0 }
 }
 
 fn is_unsupported_type(ct: &str) -> bool {
@@ -249,6 +254,16 @@ fn fastrand(max: u64) -> u64 {
     }
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
     nanos % max
+}
+
+/// 默认排序：发布时间倒序（越近越前）；引擎没给日期的排在有日期的之后，组内保持引擎原序
+fn sort_by_recency(kept: &mut [PackagedResult]) {
+    kept.sort_by(|a, b| match (a.published.as_deref(), b.published.as_deref()) {
+        (Some(x), Some(y)) => y.cmp(x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
 }
 
 // ---------------------------------------------------------------- site adapters
@@ -287,6 +302,22 @@ fn site_request(kind: &str, site: Option<&str>, query: &str) -> Option<(String, 
         "openalex" => (format!("https://api.openalex.org/works?search={q}&per_page=8"), None, "https://openalex.org/".into(), "https://openalex.org".into()),
         "crossref" => (format!("https://api.crossref.org/works?query={q}&rows=8"), None, "https://www.crossref.org/".into(), "https://www.crossref.org".into()),
         "arxiv" => (format!("https://export.arxiv.org/api/query?search_query=all:{q}&max_results=8"), None, "https://arxiv.org/".into(), "https://arxiv.org".into()),
+        "openreview" => (
+            format!("https://api2.openreview.net/notes/search?term={q}&source=forum&limit=8"),
+            None,
+            "https://openreview.net/".into(),
+            "https://openreview.net".into(),
+        ),
+        // 期刊级检索：site = ISSN
+        "openalex-venue" => (
+            format!(
+                "https://api.openalex.org/works?filter=primary_location.source.issn:{}&search={q}&per-page=8",
+                site.unwrap_or_default()
+            ),
+            None,
+            "https://openalex.org/".into(),
+            "https://openalex.org".into(),
+        ),
         _ => return None,
     };
     Some((url, body, referer, origin))
@@ -320,7 +351,9 @@ fn parse_site_response(kind: &str, body: &str) -> Vec<SearchResult> {
                 "juejin" => adapters::parse_juejin(&json),
                 "csdn" => adapters::parse_csdn(&json),
                 "openalex" => adapters::parse_openalex(&json),
+                "openalex-venue" => adapters::parse_openalex(&json),
                 "crossref" => adapters::parse_crossref(&json),
+                "openreview" => adapters::parse_openreview(&json),
                 _ => vec![],
             }
         }
@@ -355,6 +388,7 @@ impl Engine {
         let content_top = params.content_top.unwrap_or(DEFAULT_CONTENT_TOP);
         let content_chars = params.content_chars.unwrap_or(DEFAULT_CONTENT_CHARS).min(5000);
         let min_weight = params.min_weight;
+        let sort_by_time = params.sort_by.as_deref().unwrap_or("time") != "relevance";
         let weights = self.store.load_weights()?;
 
         // 站内直达 or Bing 全网
@@ -428,7 +462,7 @@ impl Engine {
         }
         let serp_ms = serp_started.elapsed().as_millis() as u64;
 
-        // 只留内容页 → 黑名单 → 权重 → 截断
+        // 只留内容页 → 黑名单 → 权重 → 按时间排序 → 截断
         let mut dropped: Vec<DroppedResult> = Vec::new();
         let mut kept: Vec<PackagedResult> = Vec::new();
         for (r, via) in candidates {
@@ -458,13 +492,21 @@ impl Engine {
                 weight_source: key,
                 via,
                 snippet: r.snippet,
+                published: r.published,
                 content: None,
                 confidence: None,
                 relevance: None,
                 support: None,
+                recency: None,
             });
         }
+        if sort_by_time {
+            sort_by_recency(&mut kept);
+        }
         kept.truncate(count);
+        for (i, r) in kept.iter_mut().enumerate() {
+            r.rank = i + 1;
+        }
         if kept.is_empty() {
             anyhow::bail!(
                 "全部结果被过滤（{}）",
@@ -514,7 +556,21 @@ impl Engine {
         }
         let content_ms = content_started.elapsed().as_millis() as u64;
 
-        // 置信度：相关性 + 信源权重 + 多源印证（同批内、跨域名）
+        // 引擎没给日期的，用页面自带时间补上，再按时间重排一次（内容跟着结果走）
+        for r in kept.iter_mut() {
+            if r.published.is_none() {
+                r.published = r.content.as_ref().and_then(|c| c.published.clone());
+            }
+            r.recency = Some(weights::round_to(text::recency_score(r.published.as_deref()), 3));
+        }
+        if sort_by_time {
+            sort_by_recency(&mut kept);
+        }
+        for (i, r) in kept.iter_mut().enumerate() {
+            r.rank = i + 1;
+        }
+
+        // 置信度：相关性 + 信源权重 + 多源印证（同批内、跨域名）+ 新鲜度
         let embed_started = Instant::now();
         let mut vectors: Vec<Option<Vec<f32>>> = vec![None; kept.len()];
         let texts: Vec<String> = kept
@@ -552,7 +608,8 @@ impl Engine {
                 }
                 kept[*idx].relevance = Some(weights::round_to(relevance, 3));
                 kept[*idx].support = Some(domains.len());
-                kept[*idx].confidence = Some(weights::score_confidence(relevance, kept[*idx].weight, domains.len()));
+                let recency = kept[*idx].recency.unwrap_or(0.5);
+                kept[*idx].confidence = Some(weights::score_confidence(relevance, kept[*idx].weight, domains.len(), recency));
                 // 顺带把向量补进缓存（抓取期没算）
                 if let Some(content) = &kept[*idx].content {
                     if content.ok && !content.core_text.is_empty() {
@@ -595,6 +652,7 @@ impl Engine {
                 fetched_pages,
                 failed_pages,
                 sites: sites_used,
+                sort_by: if sort_by_time { "time".to_string() } else { "relevance".to_string() },
                 timings: Timings {
                     serp_ms,
                     content_ms,
@@ -702,6 +760,7 @@ impl Engine {
                 ok: true,
                 title: cached.title,
                 core_text: cached.core_text.clone(),
+                published: None,
                 error: None,
                 chars: cached.core_text.chars().count(),
             },
