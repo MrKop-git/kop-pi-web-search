@@ -1,5 +1,10 @@
-# third-party runtime artifacts (fetched by scripts/fetch-vendor.sh)
+# Rust build artifacts
+core/target/
+core/bin/
+
+# third-party runtime artifacts of the legacy TypeScript implementation
 vendor/
+legacy-ts/vendor/
 
 # local data / scratch
 *.db
