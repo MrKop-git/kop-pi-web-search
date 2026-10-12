@@ -230,10 +230,65 @@ pub fn match_weight(weights: &SourceWeights, host: &str) -> (f32, Option<String>
 }
 
 /// 域名后缀匹配：`a.b.com` 命中 `b.com`，`notb.com` 与 `github.com.evil.cn` 不命中
+/// 域名匹配，两种写法（照 codex 的 allow/deny 模式语义）：
+/// - 普通域名按后缀：`github.com` 命中 `a.github.com`、不命中 `notgithub.com`
+/// - 通配：`*` 匹配一段（`*.github.com` 命中子域、不含根域），`**` 匹配零到多段
+///   （`**.github.com` 连根域一起命中），段内也能用（`region*.foo.com`）
 pub fn domain_matches(host: &str, pattern: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
-    !pattern.is_empty() && (host == pattern || host.ends_with(&format!(".{pattern}")))
+    if pattern.is_empty() {
+        return false;
+    }
+    if !pattern.contains('*') {
+        return host == pattern || host.ends_with(&format!(".{pattern}"));
+    }
+    let host_labels: Vec<&str> = host.split('.').collect();
+    let pattern_labels: Vec<&str> = pattern.split('.').collect();
+    glob_labels(&host_labels, &pattern_labels)
+}
+
+fn glob_labels(host: &[&str], pattern: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => host.is_empty(),
+        Some((&"**", rest)) => (0..=host.len()).any(|take| glob_labels(&host[take..], rest)),
+        Some((label, rest)) => match host.split_first() {
+            Some((host_label, host_rest)) => label_matches(host_label, label) && glob_labels(host_rest, rest),
+            None => false,
+        },
+    }
+}
+
+/// 单段内的通配：`*` 任意、`region*` 前缀、`*core*` 包含
+fn label_matches(text: &&str, pattern: &&str) -> bool {
+    let (text, pattern) = (*text, *pattern);
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return text == pattern;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut rest = text;
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if index == 0 {
+            match rest.strip_prefix(part) {
+                Some(tail) => rest = tail,
+                None => return false,
+            }
+        } else if index == parts.len() - 1 {
+            return rest.ends_with(part);
+        } else {
+            match rest.find(part) {
+                Some(at) => rest = &rest[at + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    rest.is_empty() || parts.last().map(|part| part.is_empty()).unwrap_or(false)
 }
 
 pub fn host_of(url: &str) -> String {

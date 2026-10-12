@@ -19,7 +19,32 @@ use crate::weights;
 
 const BING_HOME: &str = "https://cn.bing.com/";
 const BING_SEARCH: &str = "https://cn.bing.com/search";
-const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// 身份池：(UA, sec-ch-ua, sec-ch-ua-platform)。同一 IP 下轮换这几个身份，
+/// 每个身份有独立 cookie jar 与独立节流表；被风控时换一个身份重试。
+const IDENTITIES: [(&str, &str, &str); 4] = [
+    (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+        "\"Linux\"",
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+        "\"Windows\"",
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+        "\"macOS\"",
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        "\"Microsoft Edge\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+        "\"Windows\"",
+    ),
+];
+/// 身份被风控后的冷却时间：这段时间内该 (host, 身份) 不再使用
+const IDENTITY_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const MIN_BING_GAP: Duration = Duration::from_millis(1200);
 const MIN_HOST_GAP: Duration = Duration::from_millis(120);
 const MAX_JITTER_MS: u64 = 400;
@@ -59,6 +84,76 @@ fn normalize_url(url: &str) -> String {
     }
 }
 
+/// 公网地址判定：私有/环回/链路本地/保留/组播段一律不算（照 dsh 的 public-address 策略）
+pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let blocked = o[0] == 0
+                || o[0] == 10
+                || o[0] == 127
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 172 && (16..32).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                || o[0] >= 224;
+            !blocked
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_public_ip(std::net::IpAddr::V4(mapped));
+            }
+            let segments = v6.segments();
+            let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+            !(v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local() || documentation)
+        }
+    }
+}
+
+/// 只抓公网目标：拦住 localhost / 内网 / 云元数据地址（模型可能被页面内容引导到这些地方）
+pub async fn ensure_public_target(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).context("无效 URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("仅支持 http/https，收到 {}", parsed.scheme());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("URL 里不允许带账号密码");
+    }
+    if url.len() > 2048 {
+        anyhow::bail!("URL 过长（{} > 2048）", url.len());
+    }
+    let Some(host) = parsed.host_str() else { anyhow::bail!("URL 缺少主机名") };
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") || lower.ends_with(".internal") {
+        anyhow::bail!("拒绝内网主机 {host}");
+    }
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        if !is_public_ip(ip) {
+            anyhow::bail!("拒绝非公网地址 {ip}");
+        }
+        return Ok(());
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host((host, port)).await {
+        Ok(found) => found.collect(),
+        Err(err) => anyhow::bail!("域名解析失败：{host}（{err}）"),
+    };
+    if addrs.is_empty() {
+        anyhow::bail!("域名解析失败：{host}");
+    }
+    for addr in &addrs {
+        if !is_public_ip(addr.ip()) {
+            anyhow::bail!("域名 {host} 解析到非公网地址 {}", addr.ip());
+        }
+    }
+    Ok(())
+}
+
 fn is_bing_host(host: &str) -> bool {
     host == "bing.com" || host.ends_with(".bing.com")
 }
@@ -69,47 +164,101 @@ fn host_of(url: &str) -> String {
 
 // ---------------------------------------------------------------- HTTP layer
 
-/// 伪装 + 限速 + 抓取。可克隆共享（reqwest::Client 内部是 Arc）。
-pub struct Fetcher {
+/// 一个「浏览器身份」：自己的 cookie jar（独立 reqwest::Client）与自己的节流表
+struct Identity {
     client: reqwest::Client,
-    db_path: PathBuf,
-    host_last_at: Arc<Mutex<HashMap<String, Instant>>>,
-    warmed_at: Arc<Mutex<Option<Instant>>>,
-    warmup: Arc<tokio::sync::Mutex<()>>,
+    user_agent: &'static str,
+    sec_ch_ua: &'static str,
+    platform: &'static str,
+    last_at: Mutex<HashMap<String, Instant>>,
+    warmed_at: Mutex<Option<Instant>>,
 }
 
-impl Clone for Fetcher {
-    fn clone(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-            db_path: self.db_path.clone(),
-            host_last_at: self.host_last_at.clone(),
-            warmed_at: self.warmed_at.clone(),
-            warmup: self.warmup.clone(),
-        }
-    }
-}
-
-impl Fetcher {
-    pub fn new(db_path: PathBuf) -> Result<Self> {
+impl Identity {
+    fn new(index: usize) -> Result<Self> {
+        let (user_agent, sec_ch_ua, platform) = IDENTITIES[index];
         let client = reqwest::Client::builder()
-            .user_agent(UA)
+            .user_agent(user_agent)
             .cookie_store(true)
             .redirect(reqwest::redirect::Policy::limited(5))
             .timeout(Duration::from_secs(12))
             .build()
             .context("构建 HTTP 客户端失败")?;
+        Ok(Self { client, user_agent, sec_ch_ua, platform, last_at: Mutex::new(HashMap::new()), warmed_at: Mutex::new(None) })
+    }
+}
+
+/// 身份池：按站点粘性分配身份，被风控时冷却并换一个
+pub struct Identities {
+    items: Vec<Identity>,
+    /// host → 身份下标（同一站点保持同一身份，避免会话跳变）
+    assigned: Mutex<HashMap<String, usize>>,
+    /// (host, 身份) → 冷却截止时间
+    cooldown: Mutex<HashMap<(String, usize), Instant>>,
+    warmup: tokio::sync::Mutex<()>,
+    pinned: Option<usize>,
+}
+
+impl Identities {
+    fn new() -> Result<Self> {
+        let mut items = Vec::new();
+        for index in 0..IDENTITIES.len() {
+            items.push(Identity::new(index)?);
+        }
+        let pinned = std::env::var("PI_WS_IDENTITY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|i| *i < IDENTITIES.len());
         Ok(Self {
-            client,
-            db_path,
-            host_last_at: Arc::new(Mutex::new(HashMap::new())),
-            warmed_at: Arc::new(Mutex::new(None)),
-            warmup: Arc::new(tokio::sync::Mutex::new(())),
+            items,
+            assigned: Mutex::new(HashMap::new()),
+            cooldown: Mutex::new(HashMap::new()),
+            warmup: tokio::sync::Mutex::new(()),
+            pinned,
         })
     }
 
-    /// 同主机保持间隔 + 抖动（Bing 更保守）
-    async fn pace(&self, host: &str) {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn cooling(&self, host: &str, index: usize) -> bool {
+        let cooldown = self.cooldown.lock().unwrap();
+        cooldown.get(&(host.to_string(), index)).map(|until| *until > Instant::now()).unwrap_or(false)
+    }
+
+    /// 选身份：粘性优先，正在冷却的跳过；全在冷却就挑最早解冻的那个
+    fn pick(&self, host: &str) -> usize {
+        if let Some(pinned) = self.pinned {
+            return pinned;
+        }
+        let current = self.assigned.lock().unwrap().get(host).copied();
+        if let Some(index) = current {
+            if !self.cooling(host, index) {
+                return index;
+            }
+        }
+        let start = current.map(|index| (index + 1) % self.len()).unwrap_or_else(|| (fastrand(self.len() as u64)) as usize);
+        for step in 0..self.len() {
+            let index = (start + step) % self.len();
+            if !self.cooling(host, index) {
+                self.assigned.lock().unwrap().insert(host.to_string(), index);
+                return index;
+            }
+        }
+        let index = (start + 1) % self.len();
+        self.assigned.lock().unwrap().insert(host.to_string(), index);
+        index
+    }
+
+    /// 标记某身份在该站点被风控：冷却它，并让该站点下次换身份
+    fn mark_blocked(&self, host: &str, index: usize) {
+        self.cooldown.lock().unwrap().insert((host.to_string(), index), Instant::now() + IDENTITY_COOLDOWN);
+        let mut assigned = self.assigned.lock().unwrap();
+        if assigned.get(host).copied() == Some(index) {
+            assigned.remove(host);
+        }
+    }
+
+    /// 同一个身份对同一主机保持间隔 + 抖动（Bing 更保守）
+    async fn pace(&self, index: usize, host: &str) {
         let (gap, jitter) = if is_bing_host(host) {
             (MIN_BING_GAP, MAX_JITTER_MS)
         } else {
@@ -117,33 +266,76 @@ impl Fetcher {
         };
         let jitter = Duration::from_millis(if jitter == 0 { 0 } else { fastrand(jitter) });
         let wait = {
-            let map = self.host_last_at.lock().unwrap();
+            let map = self.items[index].last_at.lock().unwrap();
             map.get(host).map(|last| gap.saturating_sub(last.elapsed())).unwrap_or_default()
         };
         let total = wait + jitter;
         if !total.is_zero() {
             tokio::time::sleep(total).await;
         }
-        self.host_last_at.lock().unwrap().insert(host.to_string(), Instant::now());
+        self.items[index].last_at.lock().unwrap().insert(host.to_string(), Instant::now());
+    }
+}
+
+/// 反爬信号：状态码或验证/风控页
+fn looks_blocked(status: u16, body: &str, content_type: &str) -> bool {
+    if matches!(status, 403 | 429 | 503) {
+        return true;
+    }
+    let is_html = content_type.contains("text/html") || body.trim_start().starts_with("<!doctype") || body.trim_start().starts_with("<html");
+    is_html && (text::looks_like_challenge(body) || text::looks_like_captcha(body))
+}
+
+/// 伪装 + 限速 + 抓取。可克隆共享（身份池与 reqwest::Client 内部都是 Arc）。
+pub struct Fetcher {
+    identities: Arc<Identities>,
+    db_path: PathBuf,
+}
+
+impl Clone for Fetcher {
+    fn clone(&self) -> Self {
+        Self { identities: self.identities.clone(), db_path: self.db_path.clone() }
+    }
+}
+
+impl Fetcher {
+    pub fn new(db_path: PathBuf) -> Result<Self> {
+        Ok(Self { identities: Arc::new(Identities::new()?), db_path })
     }
 
-    /// Bing 会话预热（收 cookie）；并发调用只跑一次
+    /// 当前给该主机分配的身份下标（测试与日志用）
+    pub fn identity_for(&self, host: &str) -> usize {
+        self.identities.pick(host)
+    }
+
+    /// 标记 (host, 身份) 被风控（测试用）
+    pub fn block_identity(&self, host: &str, index: usize) {
+        self.identities.mark_blocked(host, index);
+    }
+
+    pub fn identity_count(&self) -> usize {
+        self.identities.len()
+    }
+
+    /// Bing 会话预热（收 cookie）；每个身份各预热一次，并发调用只跑一次
     pub async fn ensure_bing_session(&self) {
+        let host = host_of(BING_HOME);
+        let index = self.identities.pick(&host);
         {
-            let warmed = self.warmed_at.lock().unwrap();
+            let warmed = self.identities.items[index].warmed_at.lock().unwrap();
             if warmed.map(|t| t.elapsed() < SESSION_REFRESH).unwrap_or(false) {
                 return;
             }
         }
-        let _guard = self.warmup.lock().await;
+        let _guard = self.identities.warmup.lock().await;
         {
-            let warmed = self.warmed_at.lock().unwrap();
+            let warmed = self.identities.items[index].warmed_at.lock().unwrap();
             if warmed.map(|t| t.elapsed() < SESSION_REFRESH).unwrap_or(false) {
                 return;
             }
         }
         if self.get(BING_HOME, None, "none").await.is_ok() {
-            *self.warmed_at.lock().unwrap() = Some(Instant::now());
+            *self.identities.items[index].warmed_at.lock().unwrap() = Some(Instant::now());
         }
     }
 
@@ -151,6 +343,7 @@ impl Fetcher {
         self.request(reqwest::Method::GET, url, referer, sec_fetch_site, None).await
     }
 
+    /// 发一次请求；命中反爬（状态码 / 验证页）就换个身份重试一次，仍失败则如实返回
     async fn request(
         &self,
         method: reqwest::Method,
@@ -160,40 +353,64 @@ impl Fetcher {
         body: Option<Value>,
     ) -> Result<(u16, String, String)> {
         let host = host_of(url);
-        self.pace(&host).await;
-        let mut req = self
-            .client
-            .request(method, url)
-            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .header("Upgrade-Insecure-Requests", "1")
-            .header("Sec-Fetch-Site", sec_fetch_site)
-            .header("Sec-Fetch-Mode", if body.is_some() { "cors" } else { "navigate" })
-            .header("Sec-Fetch-Dest", if body.is_some() { "empty" } else { "document" })
-            .header("sec-ch-ua", "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
-            .header("sec-ch-ua-mobile", "?0")
-            .header("sec-ch-ua-platform", "\"Linux\"");
-        if body.is_some() {
-            req = req.header("Accept", "application/json, text/plain, */*").header("Sec-Fetch-User", "?1");
-        } else {
-            req = req.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
-            req = req.header("Sec-Fetch-User", "?1");
-        }
-        if let Some(r) = referer {
-            req = req.header("Referer", r);
-        }
-        if let Some(origin) = referer.and_then(|r| url::Url::parse(r).ok()).and_then(|u| u.origin().ascii_serialization().into()) {
+        let mut attempt = 0;
+        loop {
+            let identity = self.identities.pick(&host);
+            self.identities.pace(identity, &host).await;
+
+            let mut req = self.identities.items[identity]
+                .client
+                .request(method.clone(), url)
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("Upgrade-Insecure-Requests", "1")
+                .header("Sec-Fetch-Site", sec_fetch_site)
+                .header("Sec-Fetch-Mode", if body.is_some() { "cors" } else { "navigate" })
+                .header("Sec-Fetch-Dest", if body.is_some() { "empty" } else { "document" })
+                .header("sec-ch-ua", self.identities.items[identity].sec_ch_ua)
+                .header("sec-ch-ua-mobile", "?0")
+                .header("sec-ch-ua-platform", self.identities.items[identity].platform);
             if body.is_some() {
-                req = req.header("Origin", origin);
+                req = req.header("Accept", "application/json, text/plain, */*").header("Sec-Fetch-User", "?1");
+            } else {
+                req = req.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
+                req = req.header("Sec-Fetch-User", "?1");
             }
+            if let Some(r) = referer {
+                req = req.header("Referer", r);
+            }
+            if let Some(origin) = referer.and_then(|r| url::Url::parse(r).ok()).and_then(|u| u.origin().ascii_serialization().into()) {
+                if body.is_some() {
+                    req = req.header("Origin", origin);
+                }
+            }
+            if let Some(ref payload) = body {
+                req = req.json(payload);
+            }
+
+            let response = match req.send().await {
+                Ok(response) => response,
+                Err(err) => {
+                    if attempt == 0 {
+                        eprintln!("[pi-web-search] {host} 请求失败（{err}），换身份重试");
+                        self.identities.mark_blocked(&host, identity);
+                        attempt = 1;
+                        continue;
+                    }
+                    return Err(err).context("请求失败");
+                }
+            };
+            let status = response.status().as_u16();
+            let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+            let text = response.text().await.unwrap_or_default();
+
+            if attempt == 0 && looks_blocked(status, &text, &content_type) {
+                eprintln!("[pi-web-search] {host} 命中反爬（HTTP {status}，身份 #{identity}），换身份重试");
+                self.identities.mark_blocked(&host, identity);
+                attempt = 1;
+                continue;
+            }
+            return Ok((status, text, content_type));
         }
-        if let Some(b) = body {
-            req = req.json(&b);
-        }
-        let res = req.send().await.context("请求失败")?;
-        let status = res.status().as_u16();
-        let content_type = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
-        let text = res.text().await.unwrap_or_default();
-        Ok((status, text, content_type))
     }
 
     fn db(&self) -> Result<Store> {
@@ -202,6 +419,9 @@ impl Fetcher {
 
     /// 抓一页正文：命中缓存直接用；否则抓取 + 抽取 + 写缓存（向量稍后统一补）
     pub async fn fetch_page_core(&self, url: &str, referer: Option<&str>) -> PageContent {
+        if let Err(err) = ensure_public_target(url).await {
+            return failed(format!("{err}"));
+        }
         if let Ok(store) = self.db() {
             if let Ok(Some(cached)) = store.cached_page(url, PAGE_CACHE_TTL_MS) {
                 return PageContent {
@@ -713,10 +933,8 @@ impl Engine {
     /// 单页抓取（web_fetch 工具）
     pub async fn fetch_one(&mut self, params: FetchParams) -> Result<FetchPackage> {
         let max_chars = params.max_chars.unwrap_or(20_000).min(100_000);
+        ensure_public_target(params.url.trim()).await?;
         let parsed = url::Url::parse(params.url.trim()).context("无效 URL")?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            anyhow::bail!("仅支持 http/https，收到 {}", parsed.scheme());
-        }
         let weights = self.store.load_weights()?;
         let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
         let (weight, key) = weights::match_weight(&weights, &host);

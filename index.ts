@@ -252,8 +252,12 @@ const WebSearchParams = Type.Object({
 		}),
 	),
 	recencyDays: Type.Optional(Type.Integer({ description: "只保留最近 N 天发布的结果；没有日期的结果保留", minimum: 1 })),
-	domains: Type.Optional(Type.Array(Type.String(), { description: "域名白名单（后缀匹配，如 [\"arxiv.org\",\"github.com\"]），只保留这些站的结果" })),
-	excludeDomains: Type.Optional(Type.Array(Type.String(), { description: "本次调用临时屏蔽的域名（后缀匹配）" })),
+	domains: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "域名白名单，只保留这些站的结果。可写后缀（github.com）或通配：* 匹配一段（*.github.com 只含子域）、** 匹配零到多段（**.github.com 含根域）、段内通配（region*.foo.com）",
+		}),
+	),
+	excludeDomains: Type.Optional(Type.Array(Type.String(), { description: "本次调用临时屏蔽的域名，写法同上（如 [\"**.csdn.net\",\"*.zhihu.com\"]）" })),
 	budgetMs: Type.Optional(Type.Integer({ description: "本次调用的时间预算（毫秒）：会收紧抓正文的等待窗口", minimum: 200 })),
 });
 

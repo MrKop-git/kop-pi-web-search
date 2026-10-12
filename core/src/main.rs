@@ -228,11 +228,53 @@ async fn run_selftest(engine: &mut Engine) -> Result<()> {
         format!("{messy_text:?}"),
     );
 
+    // 身份池：同站粘性、被风控后换身份（PI_WS_IDENTITY 固定身份时不测轮换）
+    let fetcher = search::Fetcher::new(std::env::temp_dir().join("pi-ws-selftest-identity.db"))?;
+    check(
+        "身份池: 至少 4 个身份且同站粘性",
+        fetcher.identity_count() >= 4 && fetcher.identity_for("example.com") == fetcher.identity_for("example.com"),
+        format!("{} 个身份", fetcher.identity_count()),
+    );
+    if std::env::var("PI_WS_IDENTITY").is_err() {
+        let first = fetcher.identity_for("example.com");
+        fetcher.block_identity("example.com", first);
+        check("身份池: 被风控后换身份", fetcher.identity_for("example.com") != first, format!("#{first} → #{}", fetcher.identity_for("example.com")));
+    }
+
+    // 公网目标校验（照 dsh：内网/环回/元数据地址一律不抓）
+    check(
+        "公网校验: 内网地址被拒",
+        !search::is_public_ip("127.0.0.1".parse().unwrap())
+            && !search::is_public_ip("169.254.169.254".parse().unwrap())
+            && !search::is_public_ip("10.1.2.3".parse().unwrap())
+            && !search::is_public_ip("::1".parse().unwrap())
+            && search::is_public_ip("1.1.1.1".parse().unwrap()),
+        String::new(),
+    );
+    check(
+        "公网校验: localhost/元数据 URL 被拒",
+        search::ensure_public_target("http://localhost:8080/x").await.is_err()
+            && search::ensure_public_target("http://169.254.169.254/latest/meta-data/").await.is_err()
+            && search::ensure_public_target("https://example.com/ok").await.is_ok(),
+        String::new(),
+    );
+
     check(
         "域名匹配: 后缀命中、伪后缀不命中",
         weights::domain_matches("a.github.com", "github.com")
             && !weights::domain_matches("notgithub.com", "github.com")
             && !weights::domain_matches("github.com.evil.cn", "github.com"),
+        String::new(),
+    );
+    check(
+        "域名通配: * 一段 / ** 零到多段 / 段内通配",
+        weights::domain_matches("a.github.com", "*.github.com")
+            && !weights::domain_matches("github.com", "*.github.com")
+            && !weights::domain_matches("a.b.github.com", "*.github.com")
+            && weights::domain_matches("github.com", "**.github.com")
+            && weights::domain_matches("a.b.github.com", "**.github.com")
+            && weights::domain_matches("region1.v2.foo.com", "region*.v2.foo.com")
+            && !weights::domain_matches("region1.v3.foo.com", "region*.v2.foo.com"),
         String::new(),
     );
 

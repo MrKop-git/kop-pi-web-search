@@ -32,6 +32,8 @@ keeps the embedding model loaded across calls.
 | **Two tools** | `web_search` (discover: results + dates, page bodies only on request) and `web_fetch` (read one page, with `find=` for keyword jumps) |
 | **Multi-query** | `queries=[...]` runs up to 4 phrasings in parallel and merges them round-robin, deduplicated by URL — one call instead of four |
 | **Filters** | `recencyDays`, `domains` (allow-list), `excludeDomains`, `minWeight`, `sites` — plus `budgetMs` to cap the content stage |
+| **Identity pool** | four coherent browser identities (UA + client hints, each with its own cookie jar and pacing); per-host sticky, and a 403/429/verification page cools that identity down and retries once with another |
+| **SSRF guard** | only public targets are fetched — loopback, private, link-local and cloud-metadata addresses are refused before any request |
 | **Search engine** | Bing SERP scraping with a coherent browser fingerprint and pacing |
 | **Site-direct search** | `sites=["github","csdn"]` skips the engine; 14 native APIs, `site:`-scoped Bing for the rest |
 | **Journals & venues** | 顶会/期刊信源：`sites=["期刊"]` 只收头部刊——SE/PL 的 TSE/TOSEM/TOPLAS/EMSE，AI/NLP 的 JMLR/TPAMI/AIJ/TACL/CL/Nature MI，以及软件学报/计算机学报，全部走 OpenAlex 按 ISSN 检索（`sites=["tse"]` 单刊直达）；`sites=["顶会"]` 覆盖 OpenReview/NeurIPS/ICML/ACL/USENIX/SIGPLAN/ICSE；另有 `大模型` / `软件工程` 领域标签 |
@@ -41,7 +43,7 @@ keeps the embedding model loaded across calls.
 | **Content pages only** | homepages, section roots and list/index pages are dropped before fetching |
 | **Core-text extraction** | nav/ads/sidebars/comment blocks/menu lines removed; headings and prose kept |
 | **Parallel scheduling** | one wait window bounds the content stage (1.5 s, and only when `includeContent=true`); pages are fetched 16-way, so more pages = more content, not more latency |
-| **Trust data** | per-domain weights and two-layer blocklists (domains + keyword patterns) in SQLite |
+| **Trust data** | per-domain weights and two-layer blocklists (domains + keyword patterns) in SQLite; domain patterns understand `*` / `**` globs |
 | **Confidence** | relevance + source weight + cross-source corroboration, from local embeddings |
 | **Storage** | SQLite (rusqlite) with sqlite-vec vectors and an FTS5 index over fetched text |
 | **Embeddings** | local ONNX (`MultilingualE5Small`, 384-dim) via fastembed; falls back to a built-in hash embedder |
@@ -112,7 +114,8 @@ web_fetch(url="https://doc.rust-lang.org/book/", fromLine=120)     # 从第 120 
 
 `web_search` parameters: `query`, `queries` (≤3 extra phrasings), `count` (8), `offset`, `sites`,
 `includeContent` (**false**), `contentTop` (8, used only when content is on), `contentChars` (1000),
-`minWeight`, `sortBy` (`time` | `relevance`), `recencyDays`, `domains`, `excludeDomains`, `budgetMs`.
+`minWeight`, `sortBy` (`time` | `relevance`), `recencyDays`, `domains`, `excludeDomains` (both take
+suffixes or `*` / `**` globs), `budgetMs`.
 `web_fetch` parameters: `url`, `maxChars` (20000), `find`, `fromLine`.
 
 Output is a JSON package — `{ query, engine, fetchedAt, results[], dropped[], meta{} }` —
@@ -190,6 +193,12 @@ sqlite3 ~/.pi/agent/web-search.db "SELECT query, fetched_at FROM searches ORDER 
   cite-your-sources instruction, so page text never reads like a system instruction.
 - **Ranking is Bing's; filtering and ordering are ours.** Homepage/list detection, the blocklists,
   the source weights and the `sortBy` date ordering are the levers that shape the result list.
+- **Identities, not one fingerprint**: four coherent (UA, client-hints, cookie-jar) identities are
+  shared across the whole process. Each host sticks to one of them so its session does not flip
+  mid-visit; a 403/429/challenge response cools that pair for 10 minutes and retries once with
+  another identity. `PI_WS_IDENTITY=0..3` pins one for debugging. TLS/HTTP2 fingerprints are still
+  the client's own (native-tls), so Cloudflare-class checks can still tell — rotating headers is not
+  impersonation, it just stops one block from bricking a site for the session.
 - **Etiquette**: Bing requests are paced ≥1.2 s apart, page fetches are capped per host, and
   pagination requests are skipped entirely (cn.bing.com ignores `first=` for session-less
   clients — verified).
