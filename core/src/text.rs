@@ -404,24 +404,25 @@ pub fn strip_boilerplate(html: &str) -> String {
     // 1) 注释 + script/style 等（简单成对删除）
     let s = strip_simple_blocks(html);
 
-    // 2) 栈扫描：命中样板标签/属性时整棵子树丢弃（正确处理嵌套）
-    let bytes = s.as_bytes();
+    // 2) 栈扫描：命中样板标签/属性时整棵子树丢弃。
+    //    按 HTML 的「可省略闭合」规则维护开放栈，不假设文档是良构的——早年用单一深度计数，
+    //    遇到 <li> 接 <li> 这类写法深度再也回不到 0，会把整页丢光（mdBook 文档页就是这样）。
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
-    let mut skip_depth = 0i32;
+    let mut skipping: Vec<String> = Vec::new();
     while i < s.len() {
         let Some(rel) = s[i..].find('<') else {
-            if skip_depth == 0 {
+            if skipping.is_empty() {
                 out.push_str(&s[i..]);
             }
             break;
         };
         let lt = i + rel;
-        if skip_depth == 0 {
+        if skipping.is_empty() {
             out.push_str(&s[i..lt]);
         }
         let Some(gt_rel) = s[lt..].find('>') else {
-            if skip_depth == 0 {
+            if skipping.is_empty() {
                 out.push_str(&s[lt..]);
             }
             break;
@@ -429,34 +430,48 @@ pub fn strip_boilerplate(html: &str) -> String {
         let gt = lt + gt_rel;
         let tag = &s[lt..=gt];
         i = gt + 1;
-        let (closing, name) = match parse_tag_name(tag) {
-            Some(v) => v,
-            None => {
-                if skip_depth == 0 {
-                    out.push_str(tag);
-                }
-                continue;
+        let Some((closing, name)) = parse_tag_name(tag) else {
+            if skipping.is_empty() {
+                out.push_str(tag);
             }
+            continue;
         };
         let is_void = VOID_TAGS.contains(&name.as_str()) || tag.trim_end().ends_with("/>");
-        if skip_depth > 0 {
+        if !skipping.is_empty() {
             if !is_void {
-                skip_depth += if closing { -1 } else { 1 };
-                if skip_depth < 0 {
-                    skip_depth = 0;
+                if closing {
+                    // 关掉最近的同名开放项；找不到（HTML 里很常见）就当噪声忽略
+                    if let Some(position) = skipping.iter().rposition(|open| open == &name) {
+                        skipping.truncate(position);
+                    }
+                } else {
+                    // 可选闭合的元素：栈顶同名时先弹出，视作兄弟节点
+                    if OPTIONAL_CLOSE.contains(&name.as_str()) && skipping.last().map(|open| open == &name).unwrap_or(false) {
+                        skipping.pop();
+                    }
+                    skipping.push(name);
                 }
             }
             continue;
         }
         if !closing && !is_void && is_boilerplate_tag(tag, &name) {
-            skip_depth = 1;
+            skipping.push(name);
             continue;
         }
         out.push_str(tag);
     }
-    let _ = bytes;
+
+    // 兜底：整页几乎被删光说明规则误伤，退回「只去脚本样式」的版本（宁可带噪声也不要空白）
+    if out.len() < 200 && s.len() > 2000 {
+        return s;
+    }
     out
 }
+
+/// HTML 允许省略闭合标签的元素（<li> 后面跟 <li> 就是兄弟，不是父子）
+const OPTIONAL_CLOSE: [&str; 15] = [
+    "li", "p", "dt", "dd", "td", "th", "tr", "option", "optgroup", "thead", "tbody", "tfoot", "colgroup", "rt", "rp",
+];
 
 fn strip_simple_blocks(html: &str) -> String {
     let mut s = remove_comments(html);
@@ -527,7 +542,13 @@ fn parse_tag_name(tag: &str) -> Option<(bool, String)> {
     if name.is_empty() { None } else { Some((closing, name)) }
 }
 
+/// 结构根元素永不整棵丢弃（有站点把 sidebar-visible 这类词写在 <html> 上）
+const STRUCTURAL_KEEP: [&str; 4] = ["html", "body", "main", "article"];
+
 fn is_boilerplate_tag(tag: &str, name: &str) -> bool {
+    if STRUCTURAL_KEEP.contains(&name) {
+        return false;
+    }
     if TAG_BOILERPLATE.contains(&name) {
         return true;
     }
@@ -539,10 +560,9 @@ fn is_boilerplate_tag(tag: &str, name: &str) -> bool {
             let quote = attr.chars().last().unwrap();
             let Some(end) = lower[start..].find(quote) else { break };
             let value = &lower[start..start + end];
-            let tokens: Vec<&str> = value
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .filter(|t| !t.is_empty())
-                .collect();
+            // class/id 是空格分隔的取值列表，只按空白切：别把 sidebar-visible、nav-wide-wrapper
+            // 这类「关键词+后缀」的名字拆出关键词（早先按连字符切，mdBook 整页都会命中 sidebar）
+            let tokens: Vec<&str> = value.split_whitespace().filter(|t| !t.is_empty()).collect();
             if tokens.iter().any(|t| ATTR_BOILERPLATE.contains(t)) {
                 return true;
             }

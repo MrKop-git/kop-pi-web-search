@@ -218,6 +218,16 @@ async fn run_selftest(engine: &mut Engine) -> Result<()> {
             && !text::older_than("不是日期", 1),
         String::new(),
     );
+    // 回归：根元素带 sidebar-visible、侧栏里 <li> 省略闭合时，正文不能被一起丢光
+    let messy = "<html class=\"light sidebar-visible\"><body><nav class=\"sidebar\"><ul><li>目录一<li>目录二</ul></nav>\
+                 <main><p>这是正文，必须留下。</p><p>第二段也要在。</p></main></body></html>";
+    let messy_text = text::html_to_text(messy);
+    check(
+        "core-text: 非良构 HTML 不丢正文",
+        messy_text.contains("必须留下") && messy_text.contains("第二段") && !messy_text.contains("目录一"),
+        format!("{messy_text:?}"),
+    );
+
     check(
         "域名匹配: 后缀命中、伪后缀不命中",
         weights::domain_matches("a.github.com", "github.com")
