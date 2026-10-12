@@ -33,6 +33,7 @@ keeps the embedding model loaded across calls.
 | **Search engine** | Bing SERP scraping with a coherent browser fingerprint and pacing |
 | **Site-direct search** | `sites=["github","csdn"]` skips the engine; 14 native APIs, `site:`-scoped Bing for the rest |
 | **Journals & venues** | 顶会/期刊信源：`sites=["期刊"]` 只收头部刊——SE/PL 的 TSE/TOSEM/TOPLAS/EMSE，AI/NLP 的 JMLR/TPAMI/AIJ/TACL/CL/Nature MI，以及软件学报/计算机学报，全部走 OpenAlex 按 ISSN 检索（`sites=["tse"]` 单刊直达）；`sites=["顶会"]` 覆盖 OpenReview/NeurIPS/ICML/ACL/USENIX/SIGPLAN/ICSE；另有 `大模型` / `软件工程` 领域标签 |
+| **Hot reload** | `cargo build` or an edit to `index.ts` takes effect on the next call — no copy step, no pi restart |
 | **Time labels** | every result carries its publish date — from the SERP block, the platform API or the page's own meta/JSON-LD — plus a freshness score |
 | **Newest first** | results are sorted by publish date (newest first, undated last) unless `sortBy="relevance"`; freshness also feeds confidence (15%) |
 | **Content pages only** | homepages, section roots and list/index pages are dropped before fetching |
@@ -59,13 +60,18 @@ ln -sfn ~/github/kop-pi-web-search ~/.pi/agent/extensions/web-search
 
 ### Hot reload
 
-`cargo build --release` 之后不需要重启 pi，也不需要再把二进制拷到 `core/bin`：
+改完不用重启 pi，也不用拷文件——两种改动都会在下一步自动生效：
 
-- **Rust 核心**：每次工具调用前比对二进制的指纹（路径 + mtime + 大小），发现被重建过就把常驻子进程换成新的，
-  下一条请求即由新核心处理；`core/bin` 与 `core/target/release` 里取较新的那个（`PI_WS_BIN` 仍然优先）。
-- **TypeScript 壳**：改 `index.ts` 后在 pi 里 `/reload`（扩展模块由 pi 自己加载，壳没法自举）。
+- **Rust 核心**：每次工具调用前解析一次二进制（`core/bin` 与 `core/target/release` 里取较新的，
+  `PI_WS_BIN` 优先），并比对指纹（路径 + mtime + 大小）；发现被重建过就把常驻子进程换成新的，
+  下一条请求由新核心处理。所以 `cargo build --release` 即生效。
+- **TypeScript 壳**：`index.ts` 被监听（`fs.watch` + 300 ms 防抖）；改动后用 pi 自带的 jiti
+  按 `moduleCache: false` 重新 import 本模块并重跑工厂，工具与 schema 同名覆盖注册
+  （pi 的 `registerTool` 会刷新工具表），旧实例的文件监听、事件订阅与核心子进程同时回收。
+  新代码有语法错误时保留当前版本并打日志，不会把扩展搞崩。
+  找不到 pi 的 jiti（例如 pi 以打包二进制运行）时只提示，原有功能照常。
 
-`node tests/hot-reload.mjs` 会验证这条链路：换掉二进制后下一条请求确实落到新进程。
+`node tests/hot-reload.mjs` 验证两条链路：换掉二进制后下一条请求落到新进程；改 `index.ts` 后工具被重新注册。
 
 For the local embedding model the core needs `libonnxruntime.so` (the `ort` crate is
 built with `load-dynamic`). It looks, in order, at:

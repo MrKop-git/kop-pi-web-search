@@ -5,21 +5,27 @@
  * 实际工作由 Rust 二进制完成：它常驻一个子进程，逐行收发 JSON，因此
  * 嵌入模型只加载一次、SQLite 连接与 HTTP 连接池跨调用复用。
  *
- * 二进制查找：PI_WS_BIN 优先；否则取 <ext>/core/bin 与 <ext>/core/target/release 里
- * 较新的那个——所以 `cargo build --release` 之后不需要再手动拷贝，下一条请求自动用新二进制。
+ * 热重载：
+ * - Rust 核心：每次请求前比对二进制指纹，被重建过就换子进程（见 CoreClient）。
+ *   二进制取 core/bin 与 core/target/release 里较新的那个，`cargo build --release` 即生效。
+ * - TS 壳：watchSelf 盯着本文件，改动后用 pi 自带的 jiti（moduleCache: false）重新 import
+ *   本模块并重跑工厂——registerTool 同名覆盖并刷新工具表，所以连 schema 一起生效。
+ *   不用再敲 /reload；jiti 找不到时（例如 pi 以打包二进制运行）只提示，不影响原有功能。
+ *
  * 数据库：PI_WS_DB_PATH 或 ~/.pi/agent/web-search.db
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync, watch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const EXTENSION_DIR = fileURLToPath(new URL(".", import.meta.url));
+const SELF_PATH = fileURLToPath(import.meta.url);
 
 /** 构建产物的候选位置（按存在性 + 新旧挑） */
 function binaryCandidates(): string[] {
@@ -62,6 +68,74 @@ function findBinary(): string | null {
 const MISSING_BINARY =
 	"未找到 Rust 核心二进制。请先构建：cd core && cargo build --release\n" +
 	`（查找位置：${binaryCandidates().join("、")}，或用 PI_WS_BIN 指定）`;
+
+// ---------------------------------------------------------------- self hot reload
+
+const RELOAD_DEBOUNCE_MS = 300;
+
+/** pi 的 node_modules：自带 jiti / typebox / pi-tui，重新加载本模块要用它 */
+function findPiNodeModules(): string | null {
+	const override = process.env.PI_AGENT_DIR;
+	if (override && existsSync(join(override, "jiti"))) return override;
+	const releases = join(homedir(), ".pi", "agent", "install", "releases");
+	try {
+		for (const version of readdirSync(releases).sort().reverse()) {
+			const nodeModules = join(releases, version, "node_modules");
+			if (existsSync(join(nodeModules, "jiti"))) return nodeModules;
+		}
+	} catch {
+		// 目录不存在就是没有：返回 null，让调用方退化成"提示用户 /reload"
+	}
+	return null;
+}
+
+/**
+ * 重新加载本模块（拿到改动后的工厂）。
+ * pi 用 `moduleCache: false` 加载扩展，所以同一个文件重新 import 会重新执行；
+ * 新模块的 import 需要同样的别名，才能解析到 typebox / pi-tui。
+ */
+async function reloadSelfFactory(): Promise<(pi: ExtensionAPI) => unknown> {
+	const nodeModules = findPiNodeModules();
+	if (!nodeModules) throw new Error("找不到 pi 的 node_modules（jiti），请用 /reload 重载扩展");
+	const { createRequire } = await import("node:module");
+	const require = createRequire(join(nodeModules, "@earendil-works", "pi-coding-agent", "package.json"));
+	const { createJiti } = await import(pathToFileURL(join(nodeModules, "jiti", "lib", "jiti.mjs")).href);
+	const jiti = createJiti(pathToFileURL(SELF_PATH).href, {
+		moduleCache: false,
+		alias: {
+			typebox: require.resolve("typebox"),
+			"@earendil-works/pi-tui": require.resolve("@earendil-works/pi-tui"),
+		},
+	});
+	const factory = await jiti.import(SELF_PATH, { default: true });
+	if (typeof factory !== "function") throw new Error("重新加载后的模块没有导出工厂函数");
+	return factory as (pi: ExtensionAPI) => unknown;
+}
+
+/** 盯着扩展目录，自己的源码一改就回调（编辑器换文件是 rename，所以监听目录而不是单文件） */
+function watchSelf(onChange: () => void): () => void {
+	const own = basename(SELF_PATH);
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	let watcher: FSWatcher | null = null;
+	try {
+		watcher = watch(dirname(SELF_PATH), (_event, filename) => {
+			const name = filename ? String(filename) : "";
+			if (name && name !== own && !name.endsWith(".ts")) return;
+			if (timer) clearTimeout(timer);
+			timer = setTimeout(() => {
+				timer = null;
+				onChange();
+			}, RELOAD_DEBOUNCE_MS);
+		});
+		watcher.on("error", () => {});
+	} catch {
+		return () => {};
+	}
+	return () => {
+		if (timer) clearTimeout(timer);
+		watcher?.close();
+	};
+}
 
 // ---------------------------------------------------------------- JSON schemas
 
@@ -249,6 +323,11 @@ class CoreClient {
 		}
 	}
 
+	/** 等在途请求收尾——热重载时别把正在跑的工具调用打断 */
+	async whenIdle(): Promise<void> {
+		await this.queue.catch(() => undefined);
+	}
+
 	/** 发送一个请求；同一时刻只允许一个在途请求，保证响应顺序可对应 */
 	request(payload: Record<string, unknown>): Promise<CoreResponse> {
 		const run = this.queue.then(() => this.send(payload));
@@ -277,10 +356,53 @@ class CoreClient {
 
 export default function webSearchExtension(pi: ExtensionAPI) {
 	const client = new CoreClient();
+	const disposers: Array<() => void> = [];
+	let reloading = false;
 
-	// 会话结束/重载时回收子进程（二进制更新由 ensureChild 自己处理）
+	const dispose = async (): Promise<void> => {
+		for (const off of disposers.splice(0)) {
+			try {
+				off();
+			} catch {
+				// 取消订阅失败无所谓：下面还会换掉整个实例
+			}
+		}
+		await client.whenIdle();
+		client.shutdown();
+	};
+
+	const stopWatching = watchSelf(() => {
+		void reload();
+	});
+
+	/**
+	 * 热重载：先取到新代码（语法错就保留当前版本），再拆掉旧实例，最后跑新工厂。
+	 * 工具是同名覆盖注册的，所以 schema 也跟着更新。
+	 */
+	async function reload(): Promise<void> {
+		if (reloading) return;
+		reloading = true;
+		try {
+			const factory = await reloadSelfFactory();
+			stopWatching();
+			await dispose();
+			await factory(pi);
+			console.error("[pi-web-search] index.ts 有改动，已热重载扩展（工具与 schema 均已更新）");
+		} catch (error) {
+			console.error(`[pi-web-search] 热重载失败，继续用当前版本：${error instanceof Error ? error.message : String(error)}（如需重来请 /reload）`);
+		} finally {
+			reloading = false;
+		}
+	}
+
+	// 会话结束/重载时收回子进程与文件监听（二进制更新由 ensureChild 自己处理）
 	if (typeof pi.on === "function") {
-		pi.on("session_shutdown", () => client.shutdown());
+		disposers.push(
+			pi.on("session_shutdown", () => {
+				stopWatching();
+				void dispose();
+			}),
+		);
 	}
 
 	pi.registerTool({
