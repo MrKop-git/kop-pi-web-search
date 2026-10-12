@@ -122,6 +122,10 @@ const DEFAULT_DOMAINS: &[(&str, f32)] = &[
     ("cloud.tencent.com", 0.7),
     ("cloud.aliyun.com", 0.7),
     ("developer.huawei.com", 0.7),
+    ("docs.nvidia.com", 0.9),
+    ("developer.nvidia.com", 0.85),
+    ("forums.developer.nvidia.com", 0.8),
+    ("discuss.pytorch.org", 0.8),
     ("sspai.com", 0.65),
     ("linux.cn", 0.65),
     ("juejin.cn", 0.6),
@@ -208,6 +212,9 @@ fn default_sites() -> Vec<(String, SiteEntry)> {
         ("jos".into(), site("jos.org.cn", &["期刊", "中文期刊", "软件学报"], "openalex-venue", Some("1000-9825"))),
         ("cjc".into(), site("cjc.ict.ac.cn", &["期刊", "中文期刊", "计算机学报"], "openalex-venue", Some("0254-4164"))),
         ("dblp".into(), site("dblp.org", &["文献索引", "ccf", "论文"], "bing-site", None)),
+        // 官方社区论坛（Discourse，原生 JSON 检索）
+        ("nvidia-forums".into(), site("forums.developer.nvidia.com", &["社区", "论坛", "nvidia", "cuda", "jetson"], "discourse", Some("forums.developer.nvidia.com"))),
+        ("pytorch-forums".into(), site("discuss.pytorch.org", &["社区", "论坛", "pytorch"], "discourse", Some("discuss.pytorch.org"))),
         ("docs.rs".into(), site("docs.rs", &["rust 文档", "api 文档"], "bing-site", None)),
         ("zhihu".into(), site("zhihu.com", &["知乎"], "bing-site", None)),
     ]

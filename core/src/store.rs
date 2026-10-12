@@ -2,7 +2,7 @@
 //! sqlite-vec vector tables. Mirrors the schema used by the TypeScript build so
 //! an existing database keeps working.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -102,6 +102,19 @@ impl Store {
 
     pub fn vec_enabled(&self) -> bool {
         self.vec_enabled
+    }
+
+    /// 最近返回过的结果 URL（跨调用防重叠用）。`fetched_at` 形如 "@1700000000"。
+    pub fn recent_urls(&self, since_epoch: i64) -> Result<HashSet<String>> {
+        let mut urls = HashSet::new();
+        let mut stmt = self.conn.prepare(
+            "select r.url from results r join searches s on s.id = r.search_id \
+             where r.dropped = 0 and cast(substr(s.fetched_at, 2) as integer) >= ?",
+        )?;
+        for row in stmt.query_map([since_epoch], |row| row.get::<_, String>(0))? {
+            urls.insert(row?);
+        }
+        Ok(urls)
     }
 
     pub fn load_weights(&self) -> Result<SourceWeights> {
@@ -373,7 +386,7 @@ fn seed(conn: &Connection, w: &SourceWeights) -> Result<()> {
 }
 
 /// 内置种子版本：新增内置信源时 +1，老库在打开时补齐缺失的行（已有行不动）
-const SEED_VERSION: i64 = 2;
+const SEED_VERSION: i64 = 3;
 
 fn seed_new_defaults(conn: &Connection) -> Result<()> {
     let current: i64 = conn

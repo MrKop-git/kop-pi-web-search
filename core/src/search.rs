@@ -58,6 +58,8 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 const DEFAULT_COUNT: usize = 8;
 const MAX_QUERIES: usize = 4;
+/// 跨调用防重叠窗口：这么多分钟内已经返回过的结果不再重复给
+const DEFAULT_DEDUPE_MINUTES: u32 = 10;
 const MAX_COUNT: usize = 20;
 const DEFAULT_CONTENT_TOP: usize = 8;
 const DEFAULT_CONTENT_CHARS: usize = 1000;
@@ -541,6 +543,16 @@ fn site_request(kind: &str, site: Option<&str>, query: &str) -> Option<(String, 
             "https://openreview.net/".into(),
             "https://openreview.net".into(),
         ),
+        // Discourse 论坛：site = 论坛主机名
+        "discourse" => {
+            let forum = site.unwrap_or_default();
+            (
+                format!("https://{forum}/search.json?q={q}"),
+                None,
+                format!("https://{forum}/"),
+                format!("https://{forum}"),
+            )
+        }
         // 期刊级检索：site = ISSN
         "openalex-venue" => (
             format!(
@@ -568,7 +580,7 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-fn parse_site_response(kind: &str, body: &str) -> Vec<SearchResult> {
+fn parse_site_response(kind: &str, body: &str, site: Option<&str>) -> Vec<SearchResult> {
     match kind {
         "arxiv" => adapters::parse_arxiv(body),
         _ => {
@@ -585,6 +597,7 @@ fn parse_site_response(kind: &str, body: &str) -> Vec<SearchResult> {
                 "csdn" => adapters::parse_csdn(&json),
                 "openalex" => adapters::parse_openalex(&json),
                 "openalex-venue" => adapters::parse_openalex(&json),
+                "discourse" => adapters::parse_discourse(&json, site.unwrap_or_default()),
                 "crossref" => adapters::parse_crossref(&json),
                 "openreview" => adapters::parse_openreview(&json),
                 _ => vec![],
@@ -634,9 +647,18 @@ impl Engine {
         let min_weight = params.min_weight;
         let sort_by_time = params.sort_by.as_deref().unwrap_or("time") != "relevance";
         let recency_days = params.recency_days;
+        let dedupe_window = params.dedupe_window_minutes.unwrap_or(DEFAULT_DEDUPE_MINUTES);
         let domains = params.domains.clone().unwrap_or_default();
         let exclude_domains = params.exclude_domains.clone().unwrap_or_default();
         let weights = self.store.load_weights()?;
+        // 跨调用防重叠：把窗口内已经给过的 URL 找出来（含站点直连与 Bing 两条路径）
+        let seen_urls: HashSet<String> = if dedupe_window > 0 {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let since = now - (dedupe_window as i64) * 60;
+            self.store.recent_urls(since)?.into_iter().map(|url| normalize_url(&url)).collect()
+        } else {
+            HashSet::new()
+        };
 
         // 站内直达 or Bing 全网
         let site_tokens = params.sites.clone().unwrap_or_default();
@@ -743,6 +765,7 @@ impl Engine {
                     continue;
                 }
             }
+            let seen = seen_urls.contains(&normalize_url(&r.url));
             kept.push(PackagedResult {
                 rank: kept.len() + 1,
                 title: r.title,
@@ -757,7 +780,21 @@ impl Engine {
                 relevance: None,
                 support: None,
                 recency: None,
+                seen,
             });
+        }
+        // 窗口内已经给过的结果直接丢掉；但如果全都被丢光，就保留并标记 seen，别让这次调用空手而归
+        if !seen_urls.is_empty() && kept.iter().any(|r| !r.seen) {
+            let (repeats, fresh): (Vec<PackagedResult>, Vec<PackagedResult>) = kept.into_iter().partition(|r| r.seen);
+            for repeat in repeats {
+                dropped.push(DroppedResult {
+                    title: repeat.title,
+                    url: repeat.url,
+                    weight: repeat.weight,
+                    reason: format!("{dedupe_window} 分钟内已返回过同一页"),
+                });
+            }
+            kept = fresh;
         }
         if sort_by_time {
             sort_by_recency(&mut kept);
@@ -893,6 +930,7 @@ impl Engine {
         }
         let embed_ms = embed_started.elapsed().as_millis() as u64;
 
+        let repeated = kept.iter().filter(|r| r.seen).count();
         let fetched_pages = kept.iter().filter(|r| r.content.as_ref().map(|c| c.ok).unwrap_or(false)).count();
         let failed_pages = kept.iter().filter(|r| r.content.is_some() && !r.content.as_ref().unwrap().ok).count();
 
@@ -917,6 +955,8 @@ impl Engine {
                 recency_days,
                 domains: if domains.is_empty() { None } else { Some(domains.clone()) },
                 exclude_domains: if exclude_domains.is_empty() { None } else { Some(exclude_domains.clone()) },
+                dedupe_window_minutes: if dedupe_window > 0 { Some(dedupe_window) } else { None },
+                repeated,
                 timings: Timings {
                     serp_ms,
                     content_ms,
@@ -1093,12 +1133,15 @@ for (alias, entry) in sites {
         let sem = sem.clone();
         let alias = alias.clone();
         let kind = entry.search.kind.clone();
+        let entry_site = entry.search.site.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
             let method = if body.is_some() { reqwest::Method::POST } else { reqwest::Method::GET };
             let _ = origin;
             match fetcher.request(method, &url, Some(&referer), "same-origin", body).await {
-                Ok((status, text, _)) if (200..300).contains(&status) => (alias, Ok(parse_site_response(&kind, &text).into_iter().take(8).collect())),
+                Ok((status, text, _)) if (200..300).contains(&status) => {
+                    (alias, Ok(parse_site_response(&kind, &text, entry_site.as_deref()).into_iter().take(8).collect()))
+                }
                 Ok((status, _, _)) => (alias, Err(anyhow::anyhow!("HTTP {status}"))),
                 Err(e) => (alias, Err(e)),
             }

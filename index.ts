@@ -167,6 +167,7 @@ const PackagedResultSchema = Type.Object({
 	relevance: Type.Union([Type.Number(), Type.Null()]),
 	support: Type.Union([Type.Integer(), Type.Null()]),
 	recency: Type.Union([Type.Number(), Type.Null()], { description: "新鲜度 0~1，半衰期 365 天，无日期为 0.5" }),
+	seen: Type.Boolean({ description: "窗口内已经给过同一 URL（重复内容，不用再看）" }),
 });
 
 const SearchPackageSchema = Type.Object({
@@ -197,6 +198,8 @@ const SearchPackageSchema = Type.Object({
 		recencyDays: Type.Union([Type.Integer(), Type.Null()]),
 		domains: Type.Union([Type.Array(Type.String()), Type.Null()]),
 		excludeDomains: Type.Union([Type.Array(Type.String()), Type.Null()]),
+		dedupeWindowMinutes: Type.Union([Type.Integer(), Type.Null()]),
+		repeated: Type.Integer({ description: "因窗口内已返回过而被丢弃的条数" }),
 		timings: Type.Object({
 			serpMs: Type.Integer(),
 			contentMs: Type.Integer(),
@@ -259,6 +262,9 @@ const WebSearchParams = Type.Object({
 	),
 	excludeDomains: Type.Optional(Type.Array(Type.String(), { description: "本次调用临时屏蔽的域名，写法同上（如 [\"**.csdn.net\",\"*.zhihu.com\"]）" })),
 	budgetMs: Type.Optional(Type.Integer({ description: "本次调用的时间预算（毫秒）：会收紧抓正文的等待窗口", minimum: 200 })),
+	dedupeWindowMinutes: Type.Optional(
+		Type.Integer({ description: "跨调用防重叠窗口（分钟，默认 10，0 关闭）：窗口内已经返回过的同一页不再重复给出（全重复时保留并标 seen）", minimum: 0 }),
+	),
 });
 
 const WebFetchParams = Type.Object({
@@ -451,6 +457,7 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 			"web_search returns titles, snippets and dates only. Fetching bodies is the slow part, so call it with includeContent only when you need the text of several pages at once — otherwise web_fetch the one or two pages you actually read.",
 			"Put alternative phrasings and English/Chinese variants in queries=[] rather than calling web_search repeatedly: one call saves round-trips, though Bing pacing still costs ≥1.2 s per query (they run in parallel but that host is throttled).",
 			"Keep a call inside a couple of seconds by default; pass budgetMs only to tighten that further.",
+			"Results you were already given in the last few minutes are dropped as repeats (see meta.repeated and the dropped reasons) — do not re-run the same query to see them again; read the page you actually need with web_fetch instead.",
 		],
 		parameters: WebSearchParams,
 		outputSchema: SearchPackageSchema,

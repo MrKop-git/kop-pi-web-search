@@ -47,6 +47,9 @@ pub struct SearchParams {
     /// 本次调用的总预算（毫秒）：超出就缩短内容等待窗口
     #[serde(default, rename = "budgetMs")]
     pub budget_ms: Option<u64>,
+    /// 跨调用防重叠窗口（分钟，默认 10；0 关闭）：窗口内已经返回过的结果不再重复给出
+    #[serde(default, rename = "dedupeWindowMinutes")]
+    pub dedupe_window_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -93,6 +96,8 @@ pub struct PackagedResult {
     pub support: Option<usize>,
     /// 新鲜度 0~1（半衰期 365 天，无日期为中性 0.5）
     pub recency: Option<f32>,
+    /// 是不是本次会话/窗口内已经给过的同一 URL
+    pub seen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +146,10 @@ pub struct PackageMeta {
     pub domains: Option<Vec<String>>,
     #[serde(rename = "excludeDomains")]
     pub exclude_domains: Option<Vec<String>>,
+    #[serde(rename = "dedupeWindowMinutes")]
+    pub dedupe_window_minutes: Option<u32>,
+    /// 因「窗口内已返回过」而被丢弃的条数
+    pub repeated: usize,
     pub timings: Timings,
 }
 

@@ -88,5 +88,21 @@ console.log(`find         matched=${found.matchedLines} lines, ${found.coreText.
 assert(found.matchedLines > 0, "find matched lines");
 assert(/^\d+: /m.test(found.coreText), "matched lines carry numbers");
 
+// 6) 跨调用防重叠：同一查询再来一次，窗口内的重复结果被丢（或标记 seen）
+const first = (await search.execute("t6a", { query: "sqlite-vec 向量检索", count: 5 }, signal(), noop, {})).structuredContent;
+const again = (await search.execute("t6b", { query: "sqlite-vec 向量检索", count: 5 }, signal(), noop, {})).structuredContent;
+const repeats = again.dropped.filter((d) => d.reason.includes("已返回过")).length;
+console.log(`dedupe       first=${first.results.length} again=${again.results.length} 丢重复=${repeats} window=${again.meta.dedupeWindowMinutes}`);
+assert(again.meta.dedupeWindowMinutes === 10, "dedupe window reported");
+assert(repeats > 0 || again.results.every((r) => r.seen), "repeat call dropped or flagged the seen pages");
+assert(again.results.length <= first.results.length, "no growth from a repeat call");
+const off = (await search.execute("t6c", { query: "sqlite-vec 向量检索", count: 5, dedupeWindowMinutes: 0 }, signal(), noop, {})).structuredContent;
+assert(off.results.every((r) => !r.seen), "window 0 disables the dedupe");
+
+// 7) 论坛信源（Discourse 原生 API）
+const forum = (await search.execute("t7", { query: "jetson fan control", sites: ["nvidia-forums"], count: 3, contentTop: 0 }, signal(), noop, {})).structuredContent;
+console.log(`forum        ${forum.results.length} 条，来自 ${[...new Set(forum.results.map((r) => new URL(r.url).hostname))].join(",")}`);
+assert(forum.results.length > 0 && forum.results[0].url.includes("forums.developer.nvidia.com"), "nvidia forums via discourse API");
+
 console.log("\nSHELL TEST PASSED");
 process.exit(0); // 常驻子进程会吊住事件循环，测试显式退出

@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
                 domains: None,
                 exclude_domains: None,
                 budget_ms: None,
+                dedupe_window_minutes: None,
             };
             match engine.search(params).await {
                 Ok(pkg) => println!("{}", serde_json::to_string_pretty(&pkg)?),
@@ -242,6 +243,21 @@ async fn run_selftest(engine: &mut Engine) -> Result<()> {
     }
 
     // 公网目标校验（照 dsh：内网/环回/元数据地址一律不抓）
+    let discourse = serde_json::json!({
+        "topics": [{"id": 42, "title": "Fan control &amp; PWM", "slug": "fan-control", "posts_count": 3, "has_accepted_answer": true, "last_posted_at": "2026-09-01T10:00:00.000Z"}],
+        "posts": [{"topic_id": 42, "blurb": "set it with pwm"}],
+    });
+    let forum = adapters::parse_discourse(&discourse, "forums.developer.nvidia.com");
+    check(
+        "站内适配器: discourse 解析（标题/URL/时间/摘要）",
+        forum.len() == 1
+            && forum[0].url == "https://forums.developer.nvidia.com/t/fan-control/42"
+            && forum[0].published.as_deref() == Some("2026-09-01")
+            && forum[0].title.contains("Fan control & PWM")
+            && forum[0].snippet.contains("pwm"),
+        format!("{:?}", forum.first().map(|r| (&r.url, &r.published))),
+    );
+
     check(
         "公网校验: 内网地址被拒",
         !search::is_public_ip("127.0.0.1".parse().unwrap())

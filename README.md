@@ -32,10 +32,11 @@ keeps the embedding model loaded across calls.
 | **Two tools** | `web_search` (discover: results + dates, page bodies only on request) and `web_fetch` (read one page, with `find=` for keyword jumps) |
 | **Multi-query** | `queries=[...]` runs up to 4 phrasings in parallel and merges them round-robin, deduplicated by URL — one call instead of four |
 | **Filters** | `recencyDays`, `domains` (allow-list), `excludeDomains`, `minWeight`, `sites` — plus `budgetMs` to cap the content stage |
+| **No repeats** | pages already returned in the last 10 minutes are dropped from a repeat call (`dedupeWindowMinutes`, 0 to disable) — across both the engine and the site-direct paths |
 | **Identity pool** | four coherent browser identities (UA + client hints, each with its own cookie jar and pacing); per-host sticky, and a 403/429/verification page cools that identity down and retries once with another |
 | **SSRF guard** | only public targets are fetched — loopback, private, link-local and cloud-metadata addresses are refused before any request |
 | **Search engine** | Bing SERP scraping with a coherent browser fingerprint and pacing |
-| **Site-direct search** | `sites=["github","csdn"]` skips the engine; 14 native APIs, `site:`-scoped Bing for the rest |
+| **Site-direct search** | `sites=["github","csdn"]` skips the engine; 16 native APIs (including Discourse communities such as `nvidia-forums`/`pytorch-forums`), `site:`-scoped Bing for the rest |
 | **Journals & venues** | 顶会/期刊信源：`sites=["期刊"]` 只收头部刊——SE/PL 的 TSE/TOSEM/TOPLAS/EMSE，AI/NLP 的 JMLR/TPAMI/AIJ/TACL/CL/Nature MI，以及软件学报/计算机学报，全部走 OpenAlex 按 ISSN 检索（`sites=["tse"]` 单刊直达）；`sites=["顶会"]` 覆盖 OpenReview/NeurIPS/ICML/ACL/USENIX/SIGPLAN/ICSE；另有 `大模型` / `软件工程` 领域标签 |
 | **Hot reload** | `cargo build` or an edit to `index.ts` takes effect on the next call — no copy step, no pi restart |
 | **Time labels** | every result carries its publish date — from the SERP block, the platform API or the page's own meta/JSON-LD — plus a freshness score |
@@ -103,6 +104,8 @@ Restart pi (or `/reload`) and both tools are available.
 web_search(query="sqlite-vec 向量检索")
 web_search(query="Strata 吞吐优化", queries=["Strata parallel slots", "Strata batch 显存"])   # 多说法一次跑完
 web_search(query="code generation", recencyDays=90, domains=["arxiv.org"])                    # 时间窗 + 域名白名单
+web_search(query="jetson fan control", sites=["nvidia-forums"])                               # 官方社区（Discourse API）
+web_search(query="cuda oom", count=5, dedupeWindowMinutes=0)                                  # 关掉防重叠窗口
 web_search(query="向量检索", sites=["掘金","中文博客"])                                        # aliases, tags or domains
 web_search(query="code generation", sites=["顶会","大模型"])                                   # 会议/领域标签
 web_search(query="code generation", sites=["期刊","tse"])                                      # 头部期刊（全量 or 单刊）
@@ -115,7 +118,7 @@ web_fetch(url="https://doc.rust-lang.org/book/", fromLine=120)     # 从第 120 
 `web_search` parameters: `query`, `queries` (≤3 extra phrasings), `count` (8), `offset`, `sites`,
 `includeContent` (**false**), `contentTop` (8, used only when content is on), `contentChars` (1000),
 `minWeight`, `sortBy` (`time` | `relevance`), `recencyDays`, `domains`, `excludeDomains` (both take
-suffixes or `*` / `**` globs), `budgetMs`.
+suffixes or `*` / `**` globs), `budgetMs`, `dedupeWindowMinutes` (10; 0 disables).
 `web_fetch` parameters: `url`, `maxChars` (20000), `find`, `fromLine`.
 
 Output is a JSON package — `{ query, engine, fetchedAt, results[], dropped[], meta{} }` —
@@ -189,6 +192,10 @@ sqlite3 ~/.pi/agent/web-search.db "SELECT query, fetched_at FROM searches ORDER 
 - **Multi-query merging** mirrors what codex/deepseek-harness do: several phrasings, merged round-robin
   and deduplicated by URL. Pipe work runs in parallel, but Bing pacing still costs ≥1.2 s per query, so
   four queries take ~5 s — the saving is round-trips, not wall-clock.
+- **Repeat calls do not repeat themselves**: every returned URL is recorded with its search, and a call
+  drops pages already returned in the last ten minutes (`via` does not matter, so a page coming back
+  through Bing after a site-direct call is caught too). If that would leave nothing at all, the repeats
+  are kept and flagged `seen` instead of returning an empty list. `dedupeWindowMinutes=0` turns it off.
 - **External content is labelled**: both tools prefix their output with an untrusted-data notice and a
   cite-your-sources instruction, so page text never reads like a system instruction.
 - **Ranking is Bing's; filtering and ordering are ours.** Homepage/list detection, the blocklists,

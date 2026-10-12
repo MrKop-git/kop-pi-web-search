@@ -398,6 +398,37 @@ pub fn parse_openreview(json: &Value) -> Vec<SearchResult> {
     out
 }
 
+/// Discourse 论坛（NVIDIA / PyTorch 等社区用同一套 API）：topics + posts.blurb
+pub fn parse_discourse(json: &Value, host: &str) -> Vec<SearchResult> {
+    let Some(topics) = as_array(json, &["topics"]) else { return vec![] };
+    let posts = as_array(json, &["posts"]).cloned().unwrap_or_default();
+    topics
+        .iter()
+        .filter_map(|topic| {
+            let id = topic.get("id").and_then(|v| v.as_i64())?;
+            let title = s(topic, "title");
+            if title.is_empty() {
+                return None;
+            }
+            let slug = s(topic, "slug");
+            let blurb = posts
+                .iter()
+                .find(|post| post.get("topic_id").and_then(|v| v.as_i64()) == Some(id))
+                .map(|post| s(post, "blurb"))
+                .unwrap_or_default();
+            let replies = topic.get("posts_count").and_then(|v| v.as_i64()).map(|n| format!("{n} 帖")).unwrap_or_default();
+            let solved = topic.get("has_accepted_answer").and_then(|v| v.as_bool()).unwrap_or(false);
+            Some(SearchResult {
+                title: text::decode_entities(&title),
+                url: format!("https://{host}/t/{slug}/{id}"),
+                snippet: join_parts(vec![if solved { "已解决".to_string() } else { String::new() }, replies, blurb], 300),
+                // 论坛看的是「最近还有没有人回」，所以用最后回复时间
+                published: text::normalize_date(&s(topic, "last_posted_at")).or_else(|| text::normalize_date(&s(topic, "created_at"))),
+            })
+        })
+        .collect()
+}
+
 /// 站内兜底：结果必须属于目标域名（Bing 有时会放宽 site:）
 pub fn filter_to_domain(results: Vec<SearchResult>, domain: &str) -> Vec<SearchResult> {
     let d = domain.to_ascii_lowercase();
