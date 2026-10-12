@@ -384,9 +384,9 @@ pub fn looks_like_challenge(html: &str) -> bool {
 
 // ---------------------------------------------------------------- core text
 
-const TAG_BOILERPLATE: [&str; 13] = [
+const TAG_BOILERPLATE: [&str; 15] = [
     "script", "style", "noscript", "svg", "iframe", "template", "form", "nav", "aside", "footer", "button",
-    "dialog", "menu",
+    "dialog", "menu", "object", "embed",
 ];
 
 const ATTR_BOILERPLATE: [&str; 26] = [
@@ -454,7 +454,7 @@ pub fn strip_boilerplate(html: &str) -> String {
             }
             continue;
         }
-        if !closing && !is_void && is_boilerplate_tag(tag, &name) {
+        if !closing && !is_void && (is_boilerplate_tag(tag, &name) || is_invisible_tag(tag, &name)) {
             skipping.push(name);
             continue;
         }
@@ -544,6 +544,67 @@ fn parse_tag_name(tag: &str) -> Option<(bool, String)> {
 
 /// 结构根元素永不整棵丢弃（有站点把 sidebar-visible 这类词写在 <html> 上）
 const STRUCTURAL_KEEP: [&str; 4] = ["html", "body", "main", "article"];
+
+/// 取属性原始值（传入的 tag 需已小写）：`name="value"` / `name='value'`
+fn attr_value(lower_tag: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}");
+        if let Some(start) = lower_tag.find(&needle) {
+            let rest = &lower_tag[start + needle.len()..];
+            if let Some(end) = rest.find(quote) {
+                return Some(rest[..end].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 布尔属性是否存在（前后是空白/`>`/`/`/`=` 才算，避免命中别的属性值里出现的同名子串）
+fn has_boolean_attr(lower_tag: &str, name: &str) -> bool {
+    let mut from = 0;
+    while let Some(position) = lower_tag[from..].find(name) {
+        let start = from + position;
+        let end = start + name.len();
+        let before_ok = start == 0 || lower_tag[..start].chars().next_back().is_some_and(char::is_whitespace);
+        let after_ok = match lower_tag[end..].chars().next() {
+            None => true,
+            Some(c) => c.is_whitespace() || c == '>' || c == '/' || c == '=',
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// 不可见内容：`hidden` / `aria-hidden="true"` / `input[type=hidden]` /
+/// 行内样式 `display:none`、`visibility:hidden|collapse`（照 dsh 的 removeNonVisibleContent 规则）
+fn is_invisible_tag(tag: &str, name: &str) -> bool {
+    let lower = tag.to_ascii_lowercase();
+    if has_boolean_attr(&lower, "hidden") {
+        return true;
+    }
+    if attr_value(&lower, "aria-hidden").is_some_and(|value| value.trim() == "true") {
+        return true;
+    }
+    if name == "input" && attr_value(&lower, "type").is_some_and(|value| value.trim() == "hidden") {
+        return true;
+    }
+    if let Some(style) = attr_value(&lower, "style") {
+        for declaration in style.split(';') {
+            let Some((property, value)) = declaration.split_once(':') else { continue };
+            let property = property.trim();
+            let value = value.trim().trim_end_matches("!important").trim();
+            if (property == "display" && value == "none")
+                || (property == "visibility" && (value == "hidden" || value == "collapse"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 fn is_boilerplate_tag(tag: &str, name: &str) -> bool {
     if STRUCTURAL_KEEP.contains(&name) {

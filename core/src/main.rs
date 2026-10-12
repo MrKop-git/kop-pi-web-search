@@ -169,6 +169,17 @@ async fn run_selftest(engine: &mut Engine) -> Result<()> {
         format!("{} / {}", weights::score_confidence(1.0, 1.0, 3, 1.0), weights::score_confidence(1.0, 1.0, 0, 0.5)),
     );
 
+    // 回归：CSS 隐藏的 SEO 垃圾不能进正文（照 dsh 的不可见内容规则）
+    let hidden_page = "<html><body><div style=\"display:none\">隐藏的推广文案</div>\
+                       <span hidden>也隐藏</span><p style='visibility: hidden !important'>还是隐藏</p>\
+                       <main><p>真正的正文在这里。</p></main></body></html>";
+    let hidden_text = text::html_to_text(hidden_page);
+    check(
+        "core-text: 删除不可见内容",
+        hidden_text.contains("真正的正文") && !hidden_text.contains("隐藏的推广") && !hidden_text.contains("也隐藏") && !hidden_text.contains("还是隐藏"),
+        format!("{hidden_text:?}"),
+    );
+
     check(
         "日期: 各种写法归一",
         text::normalize_date("2026年3月5日") == Some("2026-03-05".into())

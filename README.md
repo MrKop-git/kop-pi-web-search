@@ -42,10 +42,10 @@ keeps the embedding model loaded across calls.
 | **Time labels** | every result carries its publish date — from the SERP block, the platform API or the page's own meta/JSON-LD — plus a freshness score |
 | **Newest first** | results are sorted by publish date (newest first, undated last) unless `sortBy="relevance"`; freshness also feeds confidence (15%) |
 | **Content pages only** | homepages, section roots and list/index pages are dropped before fetching |
-| **Core-text extraction** | nav/ads/sidebars/comment blocks/menu lines removed; headings and prose kept |
+| **Core-text extraction** | nav/ads/sidebars/comment blocks/menu lines removed, plus content hidden by CSS (`display:none`, `visibility:hidden`, `hidden`, `aria-hidden`) — borrowed from DeepSeek Harness's removal rule; headings and prose kept |
 | **Parallel scheduling** | one wait window bounds the content stage (1.5 s, and only when `includeContent=true`); pages are fetched 16-way, so more pages = more content, not more latency |
 | **Trust data** | per-domain weights and two-layer blocklists (domains + keyword patterns) in SQLite; domain patterns understand `*` / `**` globs |
-| **Confidence** | relevance + source weight + cross-source corroboration, from local embeddings |
+| **Confidence** | relevance + source weight + cross-source corroboration + freshness, computed even without page bodies (title + snippet, with a lexical-coverage term so short text still separates an answered query from an ignored one); `confidenceBasis` says which |
 | **Storage** | SQLite (rusqlite) with sqlite-vec vectors and an FTS5 index over fetched text |
 | **Embeddings** | local ONNX (`MultilingualE5Small`, 384-dim) via fastembed; falls back to a built-in hash embedder |
 
@@ -118,8 +118,9 @@ web_fetch(url="https://doc.rust-lang.org/book/", fromLine=120)     # 从第 120 
 `web_search` parameters: `query`, `queries` (≤3 extra phrasings), `count` (8), `offset`, `sites`,
 `includeContent` (**false**), `contentTop` (8, used only when content is on), `contentChars` (1000),
 `minWeight`, `sortBy` (`time` | `relevance`), `recencyDays`, `domains`, `excludeDomains` (both take
-suffixes or `*` / `**` globs), `budgetMs`, `dedupeWindowMinutes` (10; 0 disables). `meta.hint` carries
-the suggested next step when a call came back short or mostly repetitive.
+suffixes or `*` / `**` globs), `budgetMs`, `dedupeWindowMinutes` (10; 0 disables), `minConfidence`.
+`meta.highConfidence` / `meta.lowConfidence` split the batch at the 0.55 bar and `meta.hint` carries the
+suggested next step when high-confidence results are scarce or the batch was mostly repeats.
 `web_fetch` parameters: `url`, `maxChars` (20000), `find`, `fromLine`.
 
 Output is a JSON package — `{ query, engine, fetchedAt, results[], dropped[], meta{} }` —
@@ -199,9 +200,10 @@ sqlite3 ~/.pi/agent/web-search.db "SELECT query, fetched_at FROM searches ORDER 
   are kept and flagged `seen` instead of returning an empty list. `dedupeWindowMinutes=0` turns it off.
 - **The package says what to do next**: neither codex nor DeepSeek Harness turns a search result's shape
   into a next-step decision — codex renders the action for the UI (`web_search_action_detail`) and counts
-  searches for analytics, dsh only appends a "Refine the query for more." line when it truncated. Here a
-  call that came back short, or that mostly hit the repeat window, sets `meta.hint` (also echoed after the
-  JSON) telling the model which lever to pull: `queries=[...]`, or relaxing `recencyDays`/`domains`.
+  searches for analytics only, dsh appends a single "Refine the query for more." line when it truncated.
+  Here the trigger is the *confidence* split, not the row count: a batch whose high-confidence count is
+  under half of what was asked sets `meta.hint` (also echoed after the JSON) naming the lever that helps —
+  more phrasings via `queries=[...]`, or constraining `domains`/`minWeight`.
 - **External content is labelled**: both tools prefix their output with an untrusted-data notice and a
   cite-your-sources instruction, so page text never reads like a system instruction.
 - **Ranking is Bing's; filtering and ordering are ours.** Homepage/list detection, the blocklists,
