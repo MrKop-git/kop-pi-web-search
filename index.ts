@@ -5,12 +5,13 @@
  * 实际工作由 Rust 二进制完成：它常驻一个子进程，逐行收发 JSON，因此
  * 嵌入模型只加载一次、SQLite 连接与 HTTP 连接池跨调用复用。
  *
- * 二进制查找顺序：PI_WS_BIN 环境变量 → <ext>/core/bin/pi-web-search → <ext>/core/target/release/pi-web-search
+ * 二进制查找：PI_WS_BIN 优先；否则取 <ext>/core/bin 与 <ext>/core/target/release 里
+ * 较新的那个——所以 `cargo build --release` 之后不需要再手动拷贝，下一条请求自动用新二进制。
  * 数据库：PI_WS_DB_PATH 或 ~/.pi/agent/web-search.db
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,17 +21,47 @@ import { Type } from "typebox";
 
 const EXTENSION_DIR = fileURLToPath(new URL(".", import.meta.url));
 
-function findBinary(): string | null {
-	const candidates = [
-		process.env.PI_WS_BIN,
+/** 构建产物的候选位置（按存在性 + 新旧挑） */
+function binaryCandidates(): string[] {
+	return [
 		join(EXTENSION_DIR, "core", "bin", "pi-web-search"),
 		join(EXTENSION_DIR, "core", "target", "release", "pi-web-search"),
-	].filter((p): p is string => Boolean(p));
-	for (const c of candidates) {
-		if (existsSync(c)) return c;
-	}
-	return null;
+	];
 }
+
+function mtimeOf(path: string): number {
+	try {
+		return statSync(path).mtimeMs;
+	} catch {
+		return -1;
+	}
+}
+
+/** 二进制指纹：路径 + mtime + 大小，用来判断"是不是刚重建过" */
+function stampOf(path: string): string {
+	try {
+		const s = statSync(path);
+		return `${path}:${s.mtimeMs}:${s.size}`;
+	} catch {
+		return `${path}:missing`;
+	}
+}
+
+function findBinary(): string | null {
+	const explicit = process.env.PI_WS_BIN;
+	if (explicit) return existsSync(explicit) ? explicit : null;
+	let best: { path: string; mtime: number } | null = null;
+	for (const candidate of binaryCandidates()) {
+		if (!existsSync(candidate)) continue;
+		const mtime = mtimeOf(candidate);
+		if (!best || mtime > best.mtime) best = { path: candidate, mtime };
+	}
+	return best?.path ?? null;
+}
+
+const MISSING_BINARY =
+	"未找到 Rust 核心二进制。请先构建：cd core && cargo build --release\n" +
+	`（查找位置：${binaryCandidates().join("、")}，或用 PI_WS_BIN 指定）`;
 
 // ---------------------------------------------------------------- JSON schemas
 
@@ -143,18 +174,32 @@ interface CoreResponse {
 
 /**
  * 常驻 Rust 核心客户端：一行请求 → 一行响应，请求串行化（核心内部已并行抓取）。
+ *
+ * 热重载：每次请求前比对二进制的指纹（路径 + mtime + 大小），发现 `cargo build`
+ * 换过文件就把旧子进程换掉，下一条请求由新核心处理——不必重启 pi。
+ * 二进制第一次出现也认（pi 先启动、后构建的场景）。
  */
 class CoreClient {
 	private child: ChildProcessWithoutNullStreams | null = null;
+	private childStamp = "";
 	private buffer = "";
 	private pending: Array<{ resolve: (v: CoreResponse) => void; reject: (e: Error) => void }> = [];
 	private queue: Promise<unknown> = Promise.resolve();
 
-	constructor(private readonly bin: string) {}
+	/** 二进制没变就复用常驻进程，变了（或还没起来）就重新拉一个 */
+	private ensureChild(): ChildProcessWithoutNullStreams {
+		const bin = findBinary();
+		if (!bin) throw new Error(MISSING_BINARY);
+		const stamp = stampOf(bin);
+		if (this.child && !this.child.killed && this.childStamp === stamp) return this.child;
 
-	private start(): ChildProcessWithoutNullStreams {
-		if (this.child && !this.child.killed) return this.child;
-		const child = spawn(this.bin, [], { stdio: ["pipe", "pipe", "pipe"] });
+		if (this.child) {
+			console.error(`[pi-web-search] 检测到核心二进制更新，热重载 ${bin}`);
+			this.shutdown();
+		}
+		this.childStamp = stamp;
+
+		const child = spawn(bin, [], { stdio: ["pipe", "pipe", "pipe"] });
 		child.stdout.setEncoding("utf-8");
 		child.stdout.on("data", (chunk: string) => this.onData(chunk));
 		child.stderr.setEncoding("utf-8");
@@ -163,7 +208,10 @@ class CoreClient {
 			if (text) console.error(`[pi-web-search] ${text}`);
 		});
 		child.on("exit", () => {
+			// 被热重载替换掉的旧进程退出时，等待队列已经属于新进程，不能动
+			if (this.child !== child) return;
 			this.child = null;
+			this.childStamp = "";
 			const pending = this.pending;
 			this.pending = [];
 			for (const p of pending) p.reject(new Error("核心进程退出"));
@@ -189,13 +237,16 @@ class CoreClient {
 		}
 	}
 
-	/** 关闭常驻子进程（pi 会话结束/重载时调用） */
+	/** 关闭常驻子进程（pi 会话结束/重载、或换二进制时调用） */
 	shutdown(): void {
-		if (this.child && !this.child.killed) {
-			this.child.stdin.end();
-			this.child.kill();
-		}
+		const child = this.child;
 		this.child = null;
+		this.childStamp = "";
+		this.buffer = "";
+		if (child && !child.killed) {
+			child.stdin.end();
+			child.kill();
+		}
 	}
 
 	/** 发送一个请求；同一时刻只允许一个在途请求，保证响应顺序可对应 */
@@ -209,7 +260,7 @@ class CoreClient {
 		return new Promise<CoreResponse>((resolve, reject) => {
 			let child: ChildProcessWithoutNullStreams;
 			try {
-				child = this.start();
+				child = this.ensureChild();
 			} catch (err) {
 				reject(err as Error);
 				return;
@@ -225,22 +276,11 @@ class CoreClient {
 // ---------------------------------------------------------------- extension
 
 export default function webSearchExtension(pi: ExtensionAPI) {
-	const bin = findBinary();
-	const client = bin ? new CoreClient(bin) : null;
+	const client = new CoreClient();
 
-	const requireClient = (): CoreClient => {
-		if (!client) {
-			throw new Error(
-				"未找到 Rust 核心二进制。请先构建：cd core && cargo build --release\n" +
-					`（期望位置：${join(EXTENSION_DIR, "core", "bin", "pi-web-search")}，或用 PI_WS_BIN 指定）`,
-			);
-		}
-		return client;
-	};
-
-	// 会话结束/重载时回收子进程
+	// 会话结束/重载时回收子进程（二进制更新由 ensureChild 自己处理）
 	if (typeof pi.on === "function") {
-		pi.on("session_shutdown", () => client?.shutdown());
+		pi.on("session_shutdown", () => client.shutdown());
 	}
 
 	pi.registerTool({
@@ -258,7 +298,7 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 		annotations: { readOnlyHint: true, openWorldHint: true, destructiveHint: false, idempotentHint: true },
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const res = await requireClient().request({ cmd: "search", ...(params as Record<string, unknown>) });
+			const res = await client.request({ cmd: "search", ...(params as Record<string, unknown>) });
 			if (res.error) throw new Error(res.error);
 			const pkg = res as unknown as Record<string, unknown>;
 			return {
@@ -298,7 +338,7 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 		annotations: { readOnlyHint: true, openWorldHint: true, destructiveHint: false, idempotentHint: true },
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const res = await requireClient().request({ cmd: "fetch", ...(params as Record<string, unknown>) });
+			const res = await client.request({ cmd: "fetch", ...(params as Record<string, unknown>) });
 			if (res.error) throw new Error(res.error);
 			const pkg = res as unknown as Record<string, unknown>;
 			const header = [

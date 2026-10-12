@@ -48,10 +48,24 @@ keeps the embedding model loaded across calls.
 ```bash
 git clone https://github.com/MrKop-git/kop-pi-web-search.git \
   ~/.pi/agent/extensions/web-search
-cd ~/.pi/agent/extensions/web-search/core
-cargo build --release
-mkdir -p bin && cp target/release/pi-web-search bin/     # 壳会优先找 core/bin/
+cd ~/.pi/agent/extensions/web-search/core && cargo build --release
 ```
+
+开发时也可以把仓库软链过去，避免每次改完还要拷文件：
+
+```bash
+ln -sfn ~/github/kop-pi-web-search ~/.pi/agent/extensions/web-search
+```
+
+### Hot reload
+
+`cargo build --release` 之后不需要重启 pi，也不需要再把二进制拷到 `core/bin`：
+
+- **Rust 核心**：每次工具调用前比对二进制的指纹（路径 + mtime + 大小），发现被重建过就把常驻子进程换成新的，
+  下一条请求即由新核心处理；`core/bin` 与 `core/target/release` 里取较新的那个（`PI_WS_BIN` 仍然优先）。
+- **TypeScript 壳**：改 `index.ts` 后在 pi 里 `/reload`（扩展模块由 pi 自己加载，壳没法自举）。
+
+`node tests/hot-reload.mjs` 会验证这条链路：换掉二进制后下一条请求确实落到新进程。
 
 For the local embedding model the core needs `libonnxruntime.so` (the `ort` crate is
 built with `load-dynamic`). It looks, in order, at:
@@ -123,7 +137,7 @@ core/src/weights.rs source weights, blocklists, site registry, hash embedder, co
 core/src/adapters.rs  the 12 platform API response parsers
 core/src/store.rs   SQLite schema, seeding, search history, fetch cache, vec tables
 core/src/embed/     fastembed wrapper + model cache (download with mirror fallback)
-tests/              pi-env.mjs (loader helper), shell-test.mjs (shell↔core), probe.mjs
+tests/              pi-env.mjs (loader), shell-test.mjs (shell↔core), hot-reload.mjs, probe.mjs
 legacy-ts/          the previous pure-TypeScript implementation (reference)
 ```
 
