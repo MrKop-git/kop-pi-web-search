@@ -168,6 +168,7 @@ const PackagedResultSchema = Type.Object({
 	support: Type.Union([Type.Integer(), Type.Null()]),
 	recency: Type.Union([Type.Number(), Type.Null()], { description: "新鲜度 0~1，半衰期 365 天，无日期为 0.5" }),
 	seen: Type.Boolean({ description: "窗口内已经给过同一 URL（重复内容，不用再看）" }),
+	confidenceBasis: Type.Union([Type.String(), Type.Null()], { description: "置信度依据：page（读了正文）或 snippet（仅标题+摘要）" }),
 });
 
 const SearchPackageSchema = Type.Object({
@@ -200,7 +201,9 @@ const SearchPackageSchema = Type.Object({
 		excludeDomains: Type.Union([Type.Array(Type.String()), Type.Null()]),
 		dedupeWindowMinutes: Type.Union([Type.Integer(), Type.Null()]),
 		repeated: Type.Integer({ description: "因窗口内已返回过而被丢弃的条数" }),
-		hint: Type.Union([Type.String(), Type.Null()], { description: "下一轮建议：结果不足或大量重复时给出，告诉模型该换词还是放宽过滤" }),
+		highConfidence: Type.Integer({ description: "高置信（≥0.55）结果条数" }),
+		lowConfidence: Type.Integer({ description: "置信度偏低的条数" }),
+		hint: Type.Union([Type.String(), Type.Null()], { description: "下一轮建议：高置信结果不足或大量重复时给出" }),
 		timings: Type.Object({
 			serpMs: Type.Integer(),
 			contentMs: Type.Integer(),
@@ -263,6 +266,9 @@ const WebSearchParams = Type.Object({
 	),
 	excludeDomains: Type.Optional(Type.Array(Type.String(), { description: "本次调用临时屏蔽的域名，写法同上（如 [\"**.csdn.net\",\"*.zhihu.com\"]）" })),
 	budgetMs: Type.Optional(Type.Integer({ description: "本次调用的时间预算（毫秒）：会收紧抓正文的等待窗口", minimum: 200 })),
+	minConfidence: Type.Optional(
+		Type.Number({ description: "置信度下限（0~1）：低于它的结果不返回（整批都低时保留最高的一条）", minimum: 0, maximum: 1 }),
+	),
 	dedupeWindowMinutes: Type.Optional(
 		Type.Integer({ description: "跨调用防重叠窗口（分钟，默认 10，0 关闭）：窗口内已经返回过的同一页不再重复给出（全重复时保留并标 seen）", minimum: 0 }),
 	),
@@ -459,7 +465,7 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 			"Put alternative phrasings and English/Chinese variants in queries=[] rather than calling web_search repeatedly: one call saves round-trips, though Bing pacing still costs ≥1.2 s per query (they run in parallel but that host is throttled).",
 			"Keep a call inside a couple of seconds by default; pass budgetMs only to tighten that further.",
 			"Results you were already given in the last few minutes are dropped as repeats (see meta.repeated and the dropped reasons) — do not re-run the same query to see them again; read the page you actually need with web_fetch instead.",
-			"When a search comes back short or mostly repeats, meta.hint says what to change: refine with queries=[...] (2-4 phrasings, Chinese and English both) or relax recencyDays/domains — repeating the identical query wastes a turn.",
+			"You do not need page bodies to judge a result: every result carries confidence (from snippet text by default, from the page when you fetched it), confidenceBasis says which, and meta.highConfidence tells you how many cleared 0.55. When the hint says high-confidence results are scarce, change the query (queries=[...]) or constrain the source (domains/minWeight) instead of paging further.",
 		],
 		parameters: WebSearchParams,
 		outputSchema: SearchPackageSchema,

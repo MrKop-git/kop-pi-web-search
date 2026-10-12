@@ -60,6 +60,8 @@ const DEFAULT_COUNT: usize = 8;
 const MAX_QUERIES: usize = 4;
 /// 跨调用防重叠窗口：这么多分钟内已经返回过的结果不再重复给
 const DEFAULT_DEDUPE_MINUTES: u32 = 10;
+/// 高置信阈值：达到它才算「够信得过」的结果
+const HIGH_CONFIDENCE: f32 = 0.55;
 const MAX_COUNT: usize = 20;
 const DEFAULT_CONTENT_TOP: usize = 8;
 const DEFAULT_CONTENT_CHARS: usize = 1000;
@@ -781,6 +783,7 @@ impl Engine {
                 support: None,
                 recency: None,
                 seen,
+                confidence_basis: None,
             });
         }
         // 窗口内已经给过的结果直接丢掉；但如果全都被丢光，就保留并标记 seen，别让这次调用空手而归
@@ -870,6 +873,8 @@ impl Engine {
         // 置信度：相关性 + 信源权重 + 多源印证（同批内、跨域名）+ 新鲜度
         let embed_started = Instant::now();
         let mut vectors: Vec<Option<Vec<f32>>> = vec![None; kept.len()];
+        // 有正文用正文（证据强），没有就用标题+摘要——默认不抓正文也要有置信度，
+        // 否则「高置信结果够不够」根本无从判断
         let texts: Vec<String> = kept
             .iter()
             .map(|r| match &r.content {
@@ -877,7 +882,7 @@ impl Engine {
                     let head: String = c.core_text.chars().take(1500).collect();
                     format!("{}\n{}", c.title, head)
                 }
-                _ => String::new(),
+                _ => format!("{}\n{}", r.title, r.snippet),
             })
             .collect();
         let idx_with_text: Vec<usize> = texts.iter().enumerate().filter(|(_, t)| !t.is_empty()).map(|(i, _)| i).collect();
@@ -888,7 +893,14 @@ impl Engine {
             let threshold = self.embedder.support_threshold();
             for (n, idx) in idx_with_text.iter().enumerate() {
                 let page_vec = page_vecs.get(n).cloned().unwrap_or_default();
-                let relevance = weights::relevance_score(&query_vec, &page_vec, self.embedder.is_semantic());
+                // 短文本（标题+摘要）语义余弦区分度差，掺入词面覆盖度
+                let relevance = if kept[*idx].content.as_ref().map(|c| c.ok && !c.core_text.is_empty()).unwrap_or(false) {
+                    weights::relevance_score(&query_vec, &page_vec, self.embedder.is_semantic())
+                } else {
+                    let semantic = weights::relevance_score(&query_vec, &page_vec, self.embedder.is_semantic());
+                    let coverage = weights::lexical_coverage(&query, &texts[*idx]);
+                    0.5 * semantic + 0.5 * coverage
+                };
                 let host = host_of(&kept[*idx].url);
                 let mut domains: HashSet<String> = HashSet::new();
                 for (m, other_idx) in idx_with_text.iter().enumerate() {
@@ -905,6 +917,13 @@ impl Engine {
                 }
                 kept[*idx].relevance = Some(weights::round_to(relevance, 3));
                 kept[*idx].support = Some(domains.len());
+                kept[*idx].confidence_basis = Some(
+                    if kept[*idx].content.as_ref().map(|c| c.ok && !c.core_text.is_empty()).unwrap_or(false) {
+                        "page".to_string()
+                    } else {
+                        "snippet".to_string()
+                    },
+                );
                 let recency = kept[*idx].recency.unwrap_or(0.5);
                 kept[*idx].confidence = Some(weights::score_confidence(relevance, kept[*idx].weight, domains.len(), recency));
                 // 顺带把向量补进缓存（抓取期没算）
@@ -930,6 +949,34 @@ impl Engine {
         }
         let embed_ms = embed_started.elapsed().as_millis() as u64;
 
+        // 置信驱动的收尾：minConfidence 过滤 + 高/低置信统计（先做统计再过滤，hint 要能说清"少在哪"）
+        let high_confidence = kept.iter().filter(|r| r.confidence.unwrap_or(0.0) >= HIGH_CONFIDENCE).count();
+        let low_confidence = kept.iter().filter(|r| r.confidence.map(|c| c < HIGH_CONFIDENCE).unwrap_or(true)).count();
+        if let Some(minimum) = params.min_confidence {
+            let (poor, good): (Vec<PackagedResult>, Vec<PackagedResult>) =
+                kept.into_iter().partition(|r| r.confidence.map(|c| c < minimum).unwrap_or(true));
+            if good.is_empty() {
+                // 全都不达标：至少留最好的一条，别让这次调用空手而归
+                let mut all = poor;
+                all.sort_by(|a, b| b.confidence.unwrap_or(0.0).partial_cmp(&a.confidence.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                all.truncate(1);
+                kept = all;
+            } else {
+                for poor_one in poor {
+                    dropped.push(DroppedResult {
+                        title: poor_one.title,
+                        url: poor_one.url,
+                        weight: poor_one.weight,
+                        reason: format!("置信度 {:.2} 低于 minConfidence={minimum}", poor_one.confidence.unwrap_or(0.0)),
+                    });
+                }
+                kept = good;
+            }
+            for (index, result) in kept.iter_mut().enumerate() {
+                result.rank = index + 1;
+            }
+        }
+
         let repeated = kept.iter().filter(|r| r.seen).count();
         // 下一轮建议：两家对标产品都只把「截断」当文案，没有把结果形状转成可执行的下一步
         let hint = {
@@ -939,7 +986,14 @@ impl Engine {
             if total_repeats > 0 {
                 parts.push(format!("{total_repeats} 条已在 {dedupe_window} 分钟窗口内给过（见 dropped）；要新内容请换说法或换站点，别重复同一查询"));
             }
-            if kept.len() < count && total_repeats == 0 {
+            // 关键判断：不是「条数不够」，而是「高置信的不够」
+            let result_count = kept.len();
+            let threshold = HIGH_CONFIDENCE;
+            if high_confidence < count.div_ceil(2).max(1) {
+                parts.push(format!(
+                    "{result_count} 条里只有 {high_confidence} 条高置信（>={threshold}），{low_confidence} 条偏低；换 2-4 种说法（queries=[...]）或限定 domains/minWeight 比继续翻页更有效"
+                ));
+            } else if kept.len() < count && total_repeats == 0 {
                 parts.push(format!(
                     "只凑到 {}/{count} 条：可放宽 recencyDays/domains，或用 queries=[...] 一次给 2–4 种说法（中英各一份也行）",
                     kept.len()
@@ -973,6 +1027,8 @@ impl Engine {
                 exclude_domains: if exclude_domains.is_empty() { None } else { Some(exclude_domains.clone()) },
                 dedupe_window_minutes: if dedupe_window > 0 { Some(dedupe_window) } else { None },
                 repeated,
+                high_confidence,
+                low_confidence,
                 hint,
                 timings: Timings {
                     serp_ms,

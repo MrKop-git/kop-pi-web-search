@@ -50,6 +50,9 @@ pub struct SearchParams {
     /// 跨调用防重叠窗口（分钟，默认 10；0 关闭）：窗口内已经返回过的结果不再重复给出
     #[serde(default, rename = "dedupeWindowMinutes")]
     pub dedupe_window_minutes: Option<u32>,
+    /// 置信度下限：低于它的结果不返回（全低时保留最高的一条）
+    #[serde(default, rename = "minConfidence")]
+    pub min_confidence: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -98,6 +101,9 @@ pub struct PackagedResult {
     pub recency: Option<f32>,
     /// 是不是本次会话/窗口内已经给过的同一 URL
     pub seen: bool,
+    /// 置信度是基于正文（page）还是仅标题+摘要（snippet）算的
+    #[serde(rename = "confidenceBasis")]
+    pub confidence_basis: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,7 +156,13 @@ pub struct PackageMeta {
     pub dedupe_window_minutes: Option<u32>,
     /// 因「窗口内已返回过」而被丢弃的条数
     pub repeated: usize,
-    /// 给模型的下一轮建议（结果不足/大量重复时给出），没有就是 null
+    /// 高置信（≥0.55）结果条数
+    #[serde(rename = "highConfidence")]
+    pub high_confidence: usize,
+    /// 置信度偏低（<0.55）的条数
+    #[serde(rename = "lowConfidence")]
+    pub low_confidence: usize,
+    /// 给模型的下一轮建议（高置信不足/大量重复时给出），没有就是 null
     pub hint: Option<String>,
     pub timings: Timings,
 }

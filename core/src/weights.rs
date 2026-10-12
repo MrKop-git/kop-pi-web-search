@@ -462,6 +462,50 @@ pub fn query_coverage(query: &[f32], page: &[f32]) -> f32 {
     if total == 0 { 0.0 } else { hit as f32 / total as f32 }
 }
 
+/// 查询词在文本里的出现比例：拉丁按整词（≥2 字符），中文按 2-gram。
+/// 语义余弦对短文本区分度差（都落在 0.8 上下），词面覆盖能把「答非所问」拉出来。
+pub fn lexical_coverage(query: &str, text: &str) -> f32 {
+    let hay = text.to_lowercase();
+    let mut total = 0usize;
+    let mut hit = 0usize;
+    let mut word = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+    let flush_word = |word: &mut String, hay: &str, total: &mut usize, hit: &mut usize| {
+        if word.chars().count() >= 2 {
+            *total += 1;
+            if hay.contains(word.as_str()) {
+                *hit += 1;
+            }
+        }
+        word.clear();
+    };
+    let flush_cjk = |cjk: &mut Vec<char>, hay: &str, total: &mut usize, hit: &mut usize| {
+        for pair in cjk.windows(2) {
+            let gram: String = pair.iter().collect();
+            *total += 1;
+            if hay.contains(&gram) {
+                *hit += 1;
+            }
+        }
+        cjk.clear();
+    };
+    for ch in query.chars() {
+        if is_cjk(ch) {
+            flush_word(&mut word, &hay, &mut total, &mut hit);
+            cjk.push(ch);
+        } else if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '+' | '#' | '-' | '.') {
+            flush_cjk(&mut cjk, &hay, &mut total, &mut hit);
+            word.push(ch);
+        } else {
+            flush_word(&mut word, &hay, &mut total, &mut hit);
+            flush_cjk(&mut cjk, &hay, &mut total, &mut hit);
+        }
+    }
+    flush_word(&mut word, &hay, &mut total, &mut hit);
+    flush_cjk(&mut cjk, &hay, &mut total, &mut hit);
+    if total == 0 { 0.0 } else { hit as f32 / total as f32 }
+}
+
 /// 相关性：哈希嵌入用「覆盖度 60% + 余弦 40%」（覆盖度抗长度稀释）；
 /// 语义嵌入（ONNX）下特征桶没有词面含义，覆盖率是噪声，直接用余弦。
 pub fn relevance_score(query: &[f32], page: &[f32], semantic: bool) -> f32 {

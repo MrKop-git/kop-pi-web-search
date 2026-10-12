@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
                 exclude_domains: None,
                 budget_ms: None,
                 dedupe_window_minutes: None,
+                min_confidence: None,
             };
             match engine.search(params).await {
                 Ok(pkg) => println!("{}", serde_json::to_string_pretty(&pkg)?),
