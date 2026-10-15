@@ -507,6 +507,20 @@ fn sort_by_recency(kept: &mut [PackagedResult]) {
 
 /// 各平台原生 API 的请求构造（URL 模板 + 可选 POST body）
 fn site_request(kind: &str, site: Option<&str>, query: &str) -> Option<(String, Option<Value>, String, String)> {
+    // RSS/Atom 订阅源：site 字段放 feed URL；服务器不做检索，条目拉回后本地过滤
+    if kind == "rss" {
+        let feed = site.unwrap_or_default().to_string();
+        if !feed.starts_with("http") {
+            return None;
+        }
+        let origin = feed
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or_default()
+            .to_string();
+        return Some((feed, None, format!("https://{origin}/"), origin));
+    }
     let q = urlencode(query);
     let (url, body, referer, origin) = match kind {
         "github" => (
@@ -582,9 +596,10 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-fn parse_site_response(kind: &str, body: &str, site: Option<&str>) -> Vec<SearchResult> {
+fn parse_site_response(kind: &str, body: &str, site: Option<&str>, query: &str) -> Vec<SearchResult> {
     match kind {
         "arxiv" => adapters::parse_arxiv(body),
+        "rss" => adapters::parse_feed(body, query),
         _ => {
             let Ok(json) = serde_json::from_str::<Value>(body) else { return vec![] };
             match kind {
@@ -1207,13 +1222,14 @@ for (alias, entry) in sites {
         let alias = alias.clone();
         let kind = entry.search.kind.clone();
         let entry_site = entry.search.site.clone();
+        let query = query.to_string();
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
             let method = if body.is_some() { reqwest::Method::POST } else { reqwest::Method::GET };
             let _ = origin;
             match fetcher.request(method, &url, Some(&referer), "same-origin", body).await {
                 Ok((status, text, _)) if (200..300).contains(&status) => {
-                    (alias, Ok(parse_site_response(&kind, &text, entry_site.as_deref()).into_iter().take(8).collect()))
+                    (alias, Ok(parse_site_response(&kind, &text, entry_site.as_deref(), &query).into_iter().take(8).collect()))
                 }
                 Ok((status, _, _)) => (alias, Err(anyhow::anyhow!("HTTP {status}"))),
                 Err(e) => (alias, Err(e)),

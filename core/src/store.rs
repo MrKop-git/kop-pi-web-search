@@ -386,7 +386,7 @@ fn seed(conn: &Connection, w: &SourceWeights) -> Result<()> {
 }
 
 /// 内置种子版本：新增内置信源时 +1，老库在打开时补齐缺失的行（已有行不动）
-const SEED_VERSION: i64 = 3;
+const SEED_VERSION: i64 = 4;
 
 fn seed_new_defaults(conn: &Connection) -> Result<()> {
     let current: i64 = conn

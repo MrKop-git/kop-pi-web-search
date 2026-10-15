@@ -37,6 +37,7 @@ keeps the embedding model loaded across calls.
 | **SSRF guard** | only public targets are fetched — loopback, private, link-local and cloud-metadata addresses are refused before any request |
 | **Search engine** | Bing SERP scraping with a coherent browser fingerprint and pacing |
 | **Site-direct search** | `sites=["github","csdn"]` skips the engine; 16 native APIs (including Discourse communities such as `nvidia-forums`/`pytorch-forums`), `site:`-scoped Bing for the rest |
+| **RSS feeds** | `sites=["phoronix"]` etc. fetch the feed (kind `rss`, feed URL in the site's `site` field), then filter items locally by query terms — newest-only recall, zero anti-bot. Built-ins: `phoronix` / `lwn` / `arch-news` / `arxiv-new` (cs.LG). With no usable query terms it degrades to the latest headlines |
 | **Journals & venues** | 顶会/期刊信源：`sites=["期刊"]` 只收头部刊——SE/PL 的 TSE/TOSEM/TOPLAS/EMSE，AI/NLP 的 JMLR/TPAMI/AIJ/TACL/CL/Nature MI，以及软件学报/计算机学报，全部走 OpenAlex 按 ISSN 检索（`sites=["tse"]` 单刊直达）；`sites=["顶会"]` 覆盖 OpenReview/NeurIPS/ICML/ACL/USENIX/SIGPLAN/ICSE；另有 `大模型` / `软件工程` 领域标签 |
 | **Hot reload** | `cargo build` or an edit to `index.ts` takes effect on the next call — no copy step, no pi restart |
 | **Time labels** | every result carries its publish date — from the SERP block, the platform API or the page's own meta/JSON-LD — plus a freshness score |

@@ -244,7 +244,8 @@ const WebSearchParams = Type.Object({
 			description:
 				"站内直达：站点别名/标签/域名（如 [\"github\"]、[\"代码\",\"csdn\"]、[\"顶会\"]、[\"期刊\"]）。提供后跳过搜索引擎，只搜这些站" +
 				"（github/gitlab/npm/crates/mdn/stackoverflow/hn/juejin/csdn/openalex/crossref/arxiv/openreview 走原生 API，" +
-				"tse/tosem/toplas/emse/tpami/jmlr/aij/tacl/cl 等头部期刊走 OpenAlex 按 ISSN 检索，其余用 site: 检索）",
+				"tse/tosem/toplas/emse/tpami/jmlr/aij/tacl/cl 等头部期刊走 OpenAlex 按 ISSN 检索，其余用 site: 检索；" +
+				"phoronix/lwn/arch-news/arxiv-new 是 RSS 订阅源，拉最新条目按查询词本地过滤",
 		}),
 	),
 	includeContent: Type.Optional(

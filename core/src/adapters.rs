@@ -443,3 +443,195 @@ pub fn filter_to_domain(results: Vec<SearchResult>, domain: &str) -> Vec<SearchR
         })
         .collect()
 }
+
+// ---------------------------------------------------------------- RSS/Atom feeds
+
+/// RSS 2.0 / Atom 订阅源即取即滤。feed 没有服务端检索，`site_request` 只把最新条目
+/// 拉回来，这里在本地按查询词过滤：命中至少一个查询词的条目才保留，按命中词数、
+/// 发布日期排序，最多 8 条。查询词全部无效时退回最新 8 条（当 headlines 用）。
+pub fn parse_feed(xml: &str, query: &str) -> Vec<SearchResult> {
+    let mut items = feed_items(xml);
+    items.sort_by(|a, b| b.published.cmp(&a.published));
+    let terms = feed_terms(query);
+    if terms.is_empty() {
+        return items.into_iter().take(8).collect();
+    }
+    let mut scored: Vec<(usize, SearchResult)> = items
+        .into_iter()
+        .filter_map(|it| {
+            let hay = format!("{} {}", it.title, it.snippet).to_lowercase();
+            let hits = terms.iter().filter(|t| hay.contains(t.as_str())).count();
+            (hits > 0).then_some((hits, it))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.published.cmp(&a.1.published)));
+    scored.into_iter().map(|(_, it)| it).take(8).collect()
+}
+
+/// 查询词清洗：去掉 site:/filetype: 之类带冒号的操作符、引号和标点壳，
+/// 长度 <2 的词（单个汉字或字母）太泛也丢掉；全没了就返回空表。
+fn feed_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for term in query.split_whitespace() {
+        let term = term.trim_matches(|c: char| !c.is_alphanumeric());
+        if term.chars().count() < 2 || term.contains(':') {
+            continue;
+        }
+        let term = term.to_lowercase();
+        if !out.contains(&term) {
+            out.push(term);
+        }
+    }
+    out
+}
+
+/// RSS 2.0 <item> 与 Atom <entry> 都吃，产出统一条目
+fn feed_items(xml: &str) -> Vec<SearchResult> {
+    let mut out = Vec::new();
+    let atom = xml.contains("<feed");
+    let (open, close) = if atom { ("<entry", "</entry>") } else { ("<item", "</item>") };
+    for chunk in xml.split(open).skip(1) {
+        let chunk = chunk.split(close).next().unwrap_or(chunk);
+        let element = |tag: &str| element_text(chunk, tag);
+
+        let raw_title = element("title");
+        if raw_title.is_empty() {
+            continue;
+        }
+        let url = if atom {
+            let l = atom_link(chunk);
+            if l.is_empty() { element("id") } else { l }
+        } else {
+            let l = element("link");
+            if l.is_empty() { element("guid") } else { l }
+        };
+        let url = url.trim().to_string();
+        if !url.starts_with("http") {
+            continue;
+        }
+        let raw_summary = if atom {
+            let s = element("summary");
+            if s.is_empty() { element("content") } else { s }
+        } else {
+            element("description")
+        };
+        let raw_date = if atom {
+            let d = element("updated");
+            if d.is_empty() { element("published") } else { d }
+        } else {
+            let d = element("pubDate");
+            if d.is_empty() { element("dc:date") } else { d }
+        };
+        out.push(SearchResult {
+            title: clean_feed_text(&raw_title),
+            url,
+            snippet: clean_feed_text(&raw_summary).chars().take(300).collect(),
+            published: text::normalize_date(&clean_feed_text(&raw_date)),
+        });
+    }
+    out
+}
+
+/// `<tag ...>text</tag>`，CDATA 剥壳；找不到返回空串
+fn element_text(chunk: &str, tag: &str) -> String {
+    let Some(pos) = chunk.find(&format!("<{tag}")) else { return String::new() };
+    let after = &chunk[pos..];
+    let Some(open_end) = after.find('>') else { return String::new() };
+    let Some(close_at) = after[open_end + 1..].find(&format!("</{tag}>")) else { return String::new() };
+    strip_cdata(&after[open_end + 1..open_end + 1 + close_at]).trim().to_string()
+}
+
+/// Atom 的链接在属性里：优先 rel="alternate"，否则第一个 href="http..."
+fn atom_link(chunk: &str) -> String {
+    let mut first = String::new();
+    let mut rest = chunk;
+    while let Some(pos) = rest.find("<link") {
+        let end = rest[pos..].find('>').map(|e| pos + e + 1).unwrap_or(rest.len());
+        let tag = &rest[pos..end];
+        let href = tag
+            .find("href=\"")
+            .and_then(|h| tag[h + 6..].find('"').map(|c| tag[h + 6..h + 6 + c].to_string()))
+            .unwrap_or_default();
+        if href.starts_with("http") {
+            if tag.contains("rel=\"alternate\"") {
+                return href;
+            }
+            if first.is_empty() {
+                first = href;
+            }
+        }
+        rest = &rest[end..];
+    }
+    first
+}
+
+/// CDATA 剥壳 + 实体解码 + 去标签 + 空白折叠
+fn clean_feed_text(raw: &str) -> String {
+    let no_cdata = strip_cdata(raw);
+    let decoded = text::decode_entities(no_cdata);
+    let no_tags = text::strip_tags(&decoded);
+    no_tags.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn strip_cdata(s: &str) -> &str {
+    let t = s.trim();
+    if let Some(inner) = t.strip_prefix("<![CDATA[") {
+        inner.strip_suffix("]]>").unwrap_or(inner)
+    } else {
+        t
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+
+    pub(crate) const RSS: &str = r##"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<item>
+  <title>NVIDIA Open-Stack Kernel Driver &quot;Update</title>
+  <link>https://www.phoronix.com/news/a</link>
+  <description><![CDATA[The <b>nvidia</b> 580 driver landed a fix.]]></description>
+  <pubDate>Wed, 14 Oct 2026 06:00:00 +0000</pubDate>
+</item>
+<item>
+  <title>AMD Radeon Benchmarks For Q4</title>
+  <link>https://www.phoronix.com/news/b</link>
+  <description>Radeon 9070 tested on Linux 6.19.</description>
+  <pubDate>Thu, 15 Oct 2026 07:30:00 +0000</pubDate>
+</item>
+<item>
+  <title>NVIDIA RTX 5090 Power Play</title>
+  <link>https://www.phoronix.com/news/c</link>
+  <description>More nvidia coverage.</description>
+  <pubDate>Fri, 16 Oct 2026 08:00:00 +0000</pubDate>
+</item>
+</channel></rss>"##;
+
+    #[test]
+    fn rss2_filters_by_query_terms() {
+        let out = parse_feed(RSS, "nvidia driver 580 site:phoronix.com");
+        assert_eq!(out.len(), 2, "AMD 条目不该命中");
+        assert!(out.iter().all(|r| r.title.to_lowercase().contains("nvidia")));
+        assert!(out[0].title.contains('"'), "实体 &quot; 应解码");
+        // 两个命中项里 driver 那条多命中一个词，排前
+        assert!(out[0].url.ends_with("/news/a"));
+        assert_eq!(out[0].published.as_deref(), Some("2026-10-14"));
+    }
+
+    #[test]
+    fn atom_link_and_date() {
+        let atom = r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
+<entry><title>Paper One</title><link rel="self" href="https://example.com/feed"/><link rel="alternate" href="https://example.com/p1"/><updated>2026-10-15T00:00:00Z</updated><summary>llama inference trick</summary></entry>
+<entry><title>Paper Two</title><link href="https://example.com/p2"/><published>2026-10-16T01:02:03Z</published><summary>unrelated topic</summary></entry>
+</feed>"#;
+        let out = parse_feed(atom, "llama");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url, "https://example.com/p1", "应选 rel=alternate 而不是 self/第一条");
+        assert_eq!(out[0].published.as_deref(), Some("2026-10-15"));
+        // 查询词无效时退回最新 headlines
+        let all = parse_feed(atom, "site:example.com");
+        assert_eq!(all.len(), 2);
+    }
+}
+
