@@ -5,13 +5,8 @@
 //! Responses mirror the TypeScript build: the search package, a fetch package, or
 //! `{"error": "..."}`. Diagnostics go to stderr so stdout stays machine-readable.
 
-mod adapters;
-mod embed;
-mod protocol;
-mod search;
-mod store;
-mod text;
-mod weights;
+// 库在 lib.rs：本文件只做 pi 扩展的常驻进程壳（stdin/stdout 行式 JSON）。
+use pi_web_search_core::{adapters, embed, protocol, search, text, weights};
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -19,8 +14,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde_json::json;
 
-use protocol::Request;
-use search::Engine;
+use pi_web_search_core::protocol::Request;
+use pi_web_search_core::search::Engine;
 
 fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
