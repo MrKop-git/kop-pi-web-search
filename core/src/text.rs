@@ -682,14 +682,22 @@ pub fn html_to_text(html: &str) -> String {
     let region = extract_region(&stripped).unwrap_or(stripped);
 
     let mut s = String::with_capacity(region.len());
+    // 行内标签（span/strong/a…）本身不产出分隔符，前后文本会直接粘起来：
+    //   <p>Class<span>by</span><span>class</span></p> → "Classbyclass"
+    // 中文不受影响（本来不加空格），所以只在**两侧都是 ASCII 字母数字**时补一个空格。
+    let mut pending_boundary = false;
     let mut i = 0usize;
     while i < region.len() {
         let rest = &region[i..];
         if let Some(rel) = rest.find('<') {
-            s.push_str(&rest[..rel]);
+            let chunk = &rest[..rel];
+            if !chunk.is_empty() {
+                push_text(&mut s, chunk, &mut pending_boundary);
+            }
             let abs = i + rel;
             let Some(gt) = region[abs..].find('>') else { break };
             let tag = &region[abs..abs + gt + 1];
+            let mut produced_separator = false;
             if let Some((closing, name)) = parse_tag_name(tag) {
                 if name.len() == 2 && name.starts_with('h') && name[1..].chars().all(|c| ('1'..='6').contains(&c)) {
                     s.push('\n');
@@ -698,18 +706,24 @@ pub fn html_to_text(html: &str) -> String {
                         s.push(HEAD_OPEN);
                         s.push('\n');
                     }
+                    produced_separator = true;
                 } else if name == "br" {
                     s.push('\n');
+                    produced_separator = true;
                 } else if name == "li" && !closing {
                     s.push('\n');
                     s.push_str("• ");
+                    produced_separator = true;
                 } else if closing && matches!(name.as_str(), "p" | "div" | "section" | "article" | "li" | "tr" | "blockquote" | "pre" | "table" | "ul" | "ol" | "dl" | "dd" | "dt") {
                     s.push_str("\n\n");
+                    produced_separator = true;
                 }
             }
+            // 没产出分隔符的标签 = 行内边界，留给下一段文本决定要不要补空格
+            pending_boundary = !produced_separator;
             i = abs + gt + 1;
         } else {
-            s.push_str(rest);
+            push_text(&mut s, rest, &mut pending_boundary);
             break;
         }
     }
@@ -725,6 +739,19 @@ pub fn html_to_text(html: &str) -> String {
         .join("\n");
     let filtered = filter_core_lines(&normalized);
     squeeze_blank_lines(&filtered)
+}
+
+/// 追加一段文本；上一个标签是行内边界、且两侧都是 ASCII 字母数字时先补一个空格。
+fn push_text(s: &mut String, chunk: &str, pending: &mut bool) {
+    if *pending {
+        if let (Some(prev), Some(next)) = (s.chars().last(), chunk.chars().next()) {
+            if prev.is_ascii_alphanumeric() && next.is_ascii_alphanumeric() {
+                s.push(' ');
+            }
+        }
+        *pending = false;
+    }
+    s.push_str(chunk);
 }
 
 fn extract_region(html: &str) -> Option<String> {
@@ -857,4 +884,29 @@ fn is_locale(seg: &str) -> bool {
     let lower = seg.to_ascii_lowercase();
     let parts: Vec<&str> = lower.split('-').collect();
     parts.len() <= 2 && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn 行内标签之间补空格() {
+        // 英文标题被拆成多个 span 时，不能粘成 Classbyclass
+        assert_eq!(html_to_text("<p>Class<span>by</span><span>class</span></p>"), "Class by class");
+        assert_eq!(html_to_text("<p>Dungeons&amp;Raids</p>"), "Dungeons&Raids");
+    }
+
+    #[test]
+    fn 中文行内标签不插空格() {
+        assert_eq!(html_to_text("<p>首领<span>技能</span>表</p>"), "首领技能表");
+    }
+
+    #[test]
+    fn 块级标签行为不变() {
+        assert_eq!(
+            html_to_text("<p>这是第一段足够长的正文内容</p><p>这是第二段足够长的正文内容</p>"),
+            "这是第一段足够长的正文内容\n这是第二段足够长的正文内容"
+        );
+    }
 }
