@@ -710,6 +710,11 @@ pub fn html_to_text(html: &str) -> String {
                 } else if name == "br" {
                     s.push('\n');
                     produced_separator = true;
+                } else if closing && matches!(name.as_str(), "td" | "th") {
+                    // 表格单元格：不这么干会粘成 "Restoration21level30"。
+                    // 用空格而不是 "|"——`|` 拼接的行会被 menu_line() 当导航行整行丢掉。
+                    s.push(' ');
+                    produced_separator = true;
                 } else if name == "li" && !closing {
                     s.push('\n');
                     s.push_str("• ");
@@ -895,6 +900,14 @@ mod boundary_tests {
         // 英文标题被拆成多个 span 时，不能粘成 Classbyclass
         assert_eq!(html_to_text("<p>Class<span>by</span><span>class</span></p>"), "Class by class");
         assert_eq!(html_to_text("<p>Dungeons&amp;Raids</p>"), "Dungeons&Raids");
+    }
+
+    #[test]
+    fn 表格单元格之间有分隔() {
+        let html = "<table><tr><td>Restoration</td><td>21</td><td>level</td><td>30</td></tr></table>";
+        let text = html_to_text(html);
+        assert!(text.contains("Restoration 21 level 30"), "{text}");
+        assert!(!text.contains("Restoration21"), "单元格不能粘连");
     }
 
     #[test]
